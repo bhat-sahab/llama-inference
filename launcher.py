@@ -35,8 +35,8 @@ MODELS = {
         "speed": "~60 t/s", "template": None, "jinja": False,
         "modes": ["Default", "MTP"],
         "mode_overrides": {
-            "Default": {"ctx": 32000, "batch": 8192, "ubatch": 4096, "kv_k": "q8_0", "kv_v": "q8_0"},
-            "MTP":     {"ctx": 32000, "batch": 8192, "ubatch": 4096, "kv_k": "q8_0", "kv_v": "q8_0"},
+            "Default": {"ctx": 32000, "batch": 8192, "ubatch": 4096, "kv_k": "q4_0", "kv_v": "q4_0"},
+            "MTP":     {"ctx": 32000, "batch": 8192, "ubatch": 4096, "kv_k": "q4_0", "kv_v": "q4_0"},
         },
         "notes": "Dense model, fits entirely on 16 GB VRAM",
         "hf_repo": "unsloth/gemma-4-12b-it-GGUF",
@@ -49,7 +49,7 @@ MODELS = {
         "speed": "~72 t/s", "template": "chat_template.jinja", "jinja": True,
         "modes": ["Default"],
         "mode_overrides": {
-            "Default": {"ctx": 128000, "batch": 8192, "ubatch": 8192, "kv_k": "q8_0", "kv_v": "q8_0"},
+            "Default": {"ctx": 128000, "batch": 8192, "ubatch": 8192, "kv_k": "q4_0", "kv_v": "q4_0"},
         },
         "notes": "Fastest model on this system",
         "hf_repo": "lmstudio-community/Qwen3.5-9B-GGUF",
@@ -62,8 +62,8 @@ MODELS = {
         "speed": "~43 t/s (default)", "template": "qwen3-coder-30b-template.jinja", "jinja": True,
         "modes": ["Default", "Full (CPU experts)", "LongCtx (200K)"],
         "mode_overrides": {
-            "Default":             {"ctx": 32000,  "batch": 4096, "ubatch": 4096, "kv_k": "q8_0", "kv_v": "q8_0"},
-            "Full (CPU experts)":  {"ctx": 64000,  "batch": 3072, "ubatch": 3072, "kv_k": "q8_0", "kv_v": "q8_0"},
+            "Default":             {"ctx": 32000,  "batch": 4096, "ubatch": 4096, "kv_k": "q4_0", "kv_v": "q4_0"},
+            "Full (CPU experts)":  {"ctx": 64000,  "batch": 3072, "ubatch": 3072, "kv_k": "q4_0", "kv_v": "q4_0"},
             "LongCtx (200K)":      {"ctx": 200000, "batch": 3072, "ubatch": 3072, "kv_k": "q4_0", "kv_v": "q4_0"},
         },
         "notes": "MoE, 3B active / 30B total",
@@ -94,8 +94,8 @@ MODELS = {
         "speed": "~200+ t/s", "template": "chat_template.jinja", "jinja": True,
         "modes": ["Default", "LongCtx (65K)"],
         "mode_overrides": {
-            "Default":      {"ctx": 65536, "batch": 4096, "ubatch": 4096, "kv_k": "q8_0", "kv_v": "q8_0"},
-            "LongCtx (65K)": {"ctx": 65536, "batch": 4096, "ubatch": 4096, "kv_k": "q8_0", "kv_v": "q8_0"},
+            "Default":      {"ctx": 65536, "batch": 4096, "ubatch": 4096, "kv_k": "q4_0", "kv_v": "q4_0"},
+            "LongCtx (65K)": {"ctx": 65536, "batch": 4096, "ubatch": 4096, "kv_k": "q4_0", "kv_v": "q4_0"},
         },
         "notes": "1-bit — runs on any backend, only 1.5 GB",
         "hf_repo": "prism-ml/Bonsai-8B-gguf",
@@ -375,7 +375,7 @@ class LauncherApp:
         ttk.Checkbutton(adv, text="Flash Attention", variable=self.flash_var).pack(anchor=W)
         self.mlock_var = BooleanVar(value=True)
         ttk.Checkbutton(adv, text="mlock (lock memory)", variable=self.mlock_var).pack(anchor=W)
-        self.nommap_var = BooleanVar(value=True)
+        self.nommap_var = BooleanVar(value=False)
         ttk.Checkbutton(adv, text="--no-mmap", variable=self.nommap_var).pack(anchor=W)
         self.jinja_var = BooleanVar(value=False)
         ttk.Checkbutton(adv, text="--jinja (chat template)", variable=self.jinja_var).pack(anchor=W)
@@ -397,8 +397,41 @@ class LauncherApp:
         ttk.Entry(gen_row, textvariable=self.top_k_var, width=8).pack(side=LEFT, padx=(0, 8))
 
         ttk.Label(gen_row, text="Repetition Penalty:", width=18).pack(side=LEFT)
-        self.repetition_penalty_var = StringVar(value="1.0")
+        self.repetition_penalty_var = StringVar(value="1.1")
         ttk.Entry(gen_row, textvariable=self.repetition_penalty_var, width=8).pack(side=LEFT)
+
+        # ── Extra server flags ──
+        extra_row1 = ttk.Frame(adv)
+        extra_row1.pack(fill=X, pady=(4, 0))
+        self.ignore_eos_var = BooleanVar(value=False)
+        ttk.Checkbutton(extra_row1, text="--ignore-eos  (don't stop at EOS)", variable=self.ignore_eos_var).pack(side=LEFT, padx=(0, 12))
+        self.no_kv_offload_var = BooleanVar(value=False)
+        ttk.Checkbutton(extra_row1, text="--no-kv-offload  (KV on CPU)", variable=self.no_kv_offload_var).pack(side=LEFT)
+
+        extra_row2 = ttk.Frame(adv)
+        extra_row2.pack(fill=X, pady=(4, 0))
+        ttk.Label(extra_row2, text="KV cache type K:", width=16).pack(side=LEFT)
+        self.kv_k_var = StringVar(value="q4_0")
+        ttk.Combobox(extra_row2, textvariable=self.kv_k_var, values=["f16", "q8_0", "q4_0"], state="readonly", width=8).pack(side=LEFT, padx=(0, 12))
+        ttk.Label(extra_row2, text="V:", width=3).pack(side=LEFT)
+        self.kv_v_var = StringVar(value="q4_0")
+        ttk.Combobox(extra_row2, textvariable=self.kv_v_var, values=["f16", "q8_0", "q4_0"], state="readonly", width=8).pack(side=LEFT)
+
+        extra_row3 = ttk.Frame(adv)
+        extra_row3.pack(fill=X, pady=(4, 0))
+        ttk.Label(extra_row3, text="Samplers:", width=10).pack(side=LEFT)
+        self.samplers_var = StringVar(value="")
+        ttk.Entry(extra_row3, textvariable=self.samplers_var, width=40).pack(side=LEFT, padx=(6, 0), fill=X, expand=True)
+        ttk.Label(extra_row3, text="  (empty=default)", foreground="gray").pack(side=LEFT)
+
+        extra_row4 = ttk.Frame(adv)
+        extra_row4.pack(fill=X, pady=(4, 0))
+        ttk.Label(extra_row4, text="Mirostat:", width=10).pack(side=LEFT)
+        self.mirostat_var = StringVar(value="0")
+        ttk.Combobox(extra_row4, textvariable=self.mirostat_var, values=["0", "1", "2"], state="readonly", width=4).pack(side=LEFT)
+        ttk.Label(extra_row4, text="  Grammar file:", width=14).pack(side=LEFT, padx=(12, 0))
+        self.grammar_var = StringVar(value="")
+        ttk.Entry(extra_row4, textvariable=self.grammar_var, width=30).pack(side=LEFT, padx=(6, 0), fill=X, expand=True)
 
         override_row = ttk.Frame(adv)
         override_row.pack(fill=X, pady=(4, 0))
@@ -706,12 +739,22 @@ class LauncherApp:
             "-ctxcp", "128",
         ]
 
-        # KV cache type from mode override
+        # KV cache type — manual overrides if set, else from mode override
+        kv_k = self.kv_k_var.get().strip()
+        kv_v = self.kv_v_var.get().strip()
+        if kv_k and kv_k != "q4_0":
+            cmd.extend(["--cache-type-k", kv_k])
+        if kv_v and kv_v != "q4_0":
+            cmd.extend(["--cache-type-v", kv_v])
+        # Apply mode override (overrides manual selection if different)
         mode = self.mode_var.get()
         mode_overrides = info.get("mode_overrides", {}).get(mode, {})
-        kv_k = mode_overrides.get("kv_k", "q8_0")
-        kv_v = mode_overrides.get("kv_v", "q8_0")
-        cmd.extend(["--cache-type-k", kv_k, "--cache-type-v", kv_v])
+        mode_kv_k = mode_overrides.get("kv_k")
+        mode_kv_v = mode_overrides.get("kv_v")
+        if mode_kv_k and mode_kv_k != kv_k:
+            cmd.extend(["--cache-type-k", mode_kv_k])
+        if mode_kv_v and mode_kv_v != kv_v:
+            cmd.extend(["--cache-type-v", mode_kv_v])
 
         if is_bonsai:
             cmd.extend(["--temp", "0.7", "--top-p", "0.95", "--top-k", "20"])
@@ -720,8 +763,22 @@ class LauncherApp:
             cmd.append("--no-mmap")
         if self.mlock_var.get():
             cmd.append("--mlock")
+        if self.ignore_eos_var.get():
+            cmd.append("--ignore-eos")
+        if self.no_kv_offload_var.get():
+            cmd.append("--no-kv-offload")
         if self.flash_var.get():
             cmd.extend(["--flash-attn", "on"])
+
+        # Sampling flags
+        if self.mirostat_var.get() not in ("", "0"):
+            cmd.extend(["--mirostat", self.mirostat_var.get()])
+        samplers = self.samplers_var.get().strip()
+        if samplers:
+            cmd.extend(["--samplers", samplers])
+        grammar = self.grammar_var.get().strip()
+        if grammar:
+            cmd.extend(["--grammar-file", grammar])
 
         # Chat template
         selected_template = self.template_var.get()
