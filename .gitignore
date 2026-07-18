@@ -1,0 +1,31 @@
+# Binaries
+llama.cpp/bin/
+
+# Models
+llama.cpp/models/
+
+# Downloaded archives
+llama.cpp/*.zip
+llama.cpp/*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Config with user paths
+launcher_config.json
+
+# PowerShell launcher (legacy — use launcher.py instead)
+llama.ps1
+
+# Temp files
+test.html
