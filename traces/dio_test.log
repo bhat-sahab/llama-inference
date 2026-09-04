@@ -1,0 +1,29 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+0.00.034.157 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.034.773 W srv  llama_server: -----------------
+0.00.034.774 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.034.775 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.034.775 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.034.775 W srv  llama_server: -----------------
+0.00.035.923 I srv    load_model: loading model '/run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/empero-ai/Qwen3.8-4B-Distill-GGUF/Qwen3.8-4B-Q8_0.gguf'
+0.00.571.319 W model has unused tensor blk.32.attn_norm.weight (size = 10240 bytes) -- ignoring
+0.00.571.323 W model has unused tensor blk.32.post_attention_norm.weight (size = 10240 bytes) -- ignoring
+0.00.571.329 W model has unused tensor blk.32.attn_q.weight (size = 22282240 bytes) -- ignoring
+0.00.571.330 W model has unused tensor blk.32.attn_k.weight (size = 2785280 bytes) -- ignoring
+0.00.571.332 W model has unused tensor blk.32.attn_v.weight (size = 2785280 bytes) -- ignoring
+0.00.571.339 W model has unused tensor blk.32.attn_output.weight (size = 11141120 bytes) -- ignoring
+0.00.571.341 W model has unused tensor blk.32.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.571.343 W model has unused tensor blk.32.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.571.345 W model has unused tensor blk.32.ffn_gate.weight (size = 25067520 bytes) -- ignoring
+0.00.571.347 W model has unused tensor blk.32.ffn_down.weight (size = 25067520 bytes) -- ignoring
+0.00.571.349 W model has unused tensor blk.32.ffn_up.weight (size = 25067520 bytes) -- ignoring
+0.00.571.351 W model has unused tensor blk.32.nextn.eh_proj.weight (size = 13926400 bytes) -- ignoring
+0.00.571.353 W model has unused tensor blk.32.nextn.enorm.weight (size = 10240 bytes) -- ignoring
+0.00.571.355 W model has unused tensor blk.32.nextn.hnorm.weight (size = 10240 bytes) -- ignoring
+0.00.571.361 W model has unused tensor blk.32.nextn.shared_head_norm.weight (size = 10240 bytes) -- ignoring
+0.00.641.480 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.01.442.471 I cmn          init: llama threadpool init, n_threads = 8
+0.01.473.834 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 1024, kv_unified = 'true'
+0.01.477.310 I srv  llama_server: model loaded
+0.01.477.316 I srv  llama_server: listening on http://127.0.0.1:8092
+0.59.995.134 I srv    operator(): operator(): cleaning up before exit...

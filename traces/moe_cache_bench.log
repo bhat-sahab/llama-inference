@@ -1,0 +1,8 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 16304 MiB):
+  Device 0: AMD Radeon RX 9070 XT, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 16304 MiB
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | type_k | type_v |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | -----: | -----: | --------------: | -------------------: |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.95 GiB |    35.51 B | ROCm       |  -1 |         18 |   q4_0 |   q4_0 |           pp512 |       920.01 ± 89.39 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.95 GiB |    35.51 B | ROCm       |  -1 |         18 |   q4_0 |   q4_0 |           tg128 |         36.37 ± 0.30 |
+
+build: d927e7d (1)

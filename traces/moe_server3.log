@@ -1,0 +1,13 @@
+0.00.013.472 W DEPRECATED: --mmap and --no-mmap are deprecated. use --load-mode mmap instead
+0.00.014.890 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.015.247 W srv  llama_server: -----------------
+0.00.015.248 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.015.249 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.015.249 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.015.249 W srv  llama_server: -----------------
+0.00.016.579 I srv    load_model: loading model '/run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf'
+0.10.860.852 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 4096, kv_unified = 'true'
+0.10.884.676 I srv          init: chat template supports preserving reasoning, consider enabling it via --reasoning-preserve
+0.10.884.717 I srv  llama_server: model loaded
+0.10.884.724 I srv  llama_server: listening on http://127.0.0.1:8095
+2.59.983.560 I srv    operator(): operator(): cleaning up before exit...

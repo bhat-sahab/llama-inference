@@ -1,0 +1,27 @@
+﻿
+
+Loading model... 
+
+ÔûäÔûä ÔûäÔûä
+ÔûêÔûê ÔûêÔûê
+ÔûêÔûê ÔûêÔûê  ÔûÇÔûÇÔûêÔûä ÔûêÔûêÔûêÔûäÔûêÔûêÔûêÔûä  ÔûÇÔûÇÔûêÔûä    ÔûäÔûêÔûêÔûêÔûê ÔûêÔûêÔûêÔûêÔûä ÔûêÔûêÔûêÔûêÔûä
+ÔûêÔûê ÔûêÔûê ÔûäÔûêÔûÇÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûäÔûêÔûÇÔûêÔûê    ÔûêÔûê    ÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûêÔûê
+ÔûêÔûê ÔûêÔûê ÔûÇÔûêÔûäÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûÇÔûêÔûäÔûêÔûê ÔûêÔûê ÔûÇÔûêÔûêÔûêÔûê ÔûêÔûêÔûêÔûêÔûÇ ÔûêÔûêÔûêÔûêÔûÇ
+                                    ÔûêÔûê    ÔûêÔûê
+                                    ÔûÇÔûÇ    ÔûÇÔûÇ
+
+build      : b10639-5e6a37cb1
+model      : C:/Users/BhatSahab/.lmstudio/models/empero-ai/Qwen3.8-4B-Distill-GGUF/Qwen3.8-4B-Q8_0.gguf
+ftype      : Q8_0
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> 

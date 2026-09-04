@@ -1,0 +1,3026 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c1d86aaac..f4ebc352b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -908,6 +908,7 @@ struct vk_device_struct {
+ 
+     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id[GGML_TYPE_COUNT];
+     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_COUNT];
++    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_COUNT];
+ 
+     vk_pipeline pipeline_matmul_split_k_reduce;
+     vk_pipeline pipeline_quantize_q8_1_x4;
+@@ -948,6 +949,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_add_id_f32;
+ 
+     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
++    vk_pipeline pipeline_concat_transpose_i32;
+     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
+     vk_pipeline pipeline_scale_f32;
+     vk_pipeline pipeline_log[2];
+@@ -2452,6 +2454,36 @@ static bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor
+     return ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
+ }
+ 
++// The delta-net conv-state path does ggml_transpose() straight into a dim-0 ggml_concat(), so the
++// generic concat walks src1 with a conv_channels * 4 byte stride. On qwen35 that is 40960 B, which
++// is 160 * 256 B with 160 % 16 == 0, so every read lands on the same one of the 16 memory channels.
++// Route that exact shape to a tiled-transpose kernel instead.
++static bool ggml_vk_concat_is_transposed(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    // On by default: +45% pp2048 on a delta-net MoE, +3.3% on a dense hybrid, never measured
++    // negative. GGML_VK_CONCAT_TRANSPOSE=0 opts out.
++    static const char * env = getenv("GGML_VK_CONCAT_TRANSPOSE");
++    if (env && env[0] == '0') {
++        return false;
++    }
++    if (dst->type != GGML_TYPE_F32) {                    // the i32 unit-size shader only
++        return false;
++    }
++    if (ggml_get_op_params_i32(dst, 0) != 0) {           // dim 0 only
++        return false;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
++        return false;
++    }
++    const size_t ts = ggml_type_size(src0->type);
++    if (src0->nb[0] != ts || dst->nb[0] != ts) {         // src0 and dst rows must be contiguous
++        return false;
++    }
++    if (src1->nb[0] <= src1->nb[1]) {                    // src1 must actually be transposed
++        return false;
++    }
++    return src0->ne[1] == src1->ne[1] && dst->ne[1] == src1->ne[1];
++}
++
+ template <typename T> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, T &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+     GGML_UNUSED(p);
+     GGML_UNUSED(src0);
+@@ -3927,6 +3959,75 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
+     };
+ }
+ 
++// SHMEM_STRIDE_PAD for mul_mm.comp (constantID=12), in FLOAT_TYPEV2 units.
++//
++// mul_mm.comp stages the shared A/B tiles at SHMEM_STRIDE = BK/2 + pad. Each element is one
++// dword, so the stride maps 1:1 onto the 32 LDS banks and gcd(SHMEM_STRIDE, 32) is the conflict
++// factor. With BK=32 the shader default of 4 gives stride 20 (gcd 4, four-way conflict). Pad 2
++// gives stride 18 (gcd 2, 16 banks) and is a large win on the quantised path on gfx1151.
++//
++// But the coopmat path passes SHMEM_STRIDE to coopMatLoad as its Stride operand, and
++// VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986 needs a 16 byte aligned stride for the
++// 16x16 f16 tiles. Stride bytes are (BK/2 + pad) * 4, so only pad % 4 == 0 is in contract.
++// RADV before 25.3 lowers coopMatLoad to ds_read_b128, which the contract entitles it to, and
++// the misaligned rows then pay runtime splits: pp512 drops by more than 2x. RADV 25.3 and later
++// lowers to ds_read_b64, which the 72 byte stride always suits, so the extra bank spread wins.
++// Use pad 2 only where it is measured to win.
++//
++// The float path keeps pad 4 on measurement, not theory: the f32/f16 shaders #define BK 32
++// whatever the host pushes, so they run the same stride, yet pad 2 measures worse on both. The
++// host warptile's BK labels the pipeline even where the shader overrides the value.
++//
++// GGML_VK_SHMEM_PAD=N overrides both paths, for probing.
++static uint32_t ggml_vk_coopmat_shmem_pad(const vk_device& device, uint32_t bk) {
++    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
++        device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
++        return 0;
++    }
++    static const int env_pad = [] {
++        const char * e = getenv("GGML_VK_SHMEM_PAD");
++        return e ? atoi(e) : -1;
++    }();
++    if (env_pad >= 0) {
++        return (uint32_t) env_pad;
++    }
++    if (device->coopmat_support && bk >= 32 &&
++        device->driver_id == vk::DriverId::eMesaRadv &&
++        device->properties.driverVersion >= VK_MAKE_API_VERSION(0, 25, 3, 0)) {
++        return 2;
++    }
++    return 4;  // mul_mm.comp default
++}
++
++// GGML_VK_DENSE_F16B: run quantized MUL_MAT against an f16 B operand instead of f32. Halves the
++// B bytes moved and the buf_b shared memory. Numerically identical: mul_mm stages B into shared
++// FLOAT_TYPE either way, so the f32-B kernel already rounds B to f16.
++//
++// 0 = off, 1 = every quantized dense matmul, auto = only the reduction width measured to gain.
++// The width equality is a stopgap until a per shape predicate is derived; it does nothing for a
++// dense model of another width.
++static int ggml_vk_dense_f16b_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_VK_DENSE_F16B");
++        if (e == nullptr) return 1;  // on by default: +4.5% dense, +4.7% MoE on gfx1151
++        if (e[0] == 'a') return 2;
++        return atoi(e) != 0 ? 1 : 0;
++    }();
++    return mode;
++}
++
++static bool ggml_vk_dense_f16b_enabled() { return ggml_vk_dense_f16b_mode() != 0; }
++
++// GGML_VK_MMID_F16B: the same idea for quantized MUL_MAT_ID. Halves the B bytes and the buf_b
++// shared memory, which also helps occupancy.
++static bool ggml_vk_mmid_f16b_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_VK_MMID_F16B");
++        return e == nullptr || atoi(e) != 0;  // on by default: +6.9% pp2048 on a MoE
++    }();
++    return enabled;
++}
++
+ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+ 
+     uint32_t lut_size = 0;
+@@ -3961,15 +4062,26 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
+         // Same kvalues budget as MXFP4 plus ue4m3_fp32_lut[128] (types.glsl, DATA_A_NVFP4).
+         lut_size = 4*16 + 128u * (uint32_t)sizeof(float);
+         break;
++    case GGML_TYPE_Q4_0_ROCMFP4:
++    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        // kvalues_rocmfp4[16] (int8) plus rocmfp_ue4m3_fp32_lut[128] (types.glsl).
++        lut_size = 16 + 128u * (uint32_t)sizeof(float);
++        break;
++    case GGML_TYPE_Q3_0_ROCMFPX:
++    case GGML_TYPE_Q6_0_ROCMFPX:
++    case GGML_TYPE_Q8_0_ROCMFPX:
++        // rocmfp_ue4m3_fp32_lut[128] only; the fp3 codebook is a const array.
++        lut_size = 128u * (uint32_t)sizeof(float);
++        break;
+     default:
+         break;
+     }
+ 
+     // Needs to be kept up to date on shader changes
+     // Needs to stay aligned with ggml_vk_mul_mm_spec.
+-    const bool intel_shmem_stride_pad_zero = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+-                                              device->driver_id == vk::DriverId::eIntelProprietaryWindows;
+-    const uint32_t bank_conflict_offset = intel_shmem_stride_pad_zero ? 0 : (device->coopmat_support ? 8 : 1);
++    // The shared tiles are (BK/2 + pad) FLOAT_TYPEV2 per row, i.e. (BK + 2*pad)
++    // elements, so the byte-space offset below is twice the shader's pad.
++    const uint32_t bank_conflict_offset = device->coopmat_support ? 2 * ggml_vk_coopmat_shmem_pad(device, warptile[3]) : 1;
+     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
+     const uint32_t warps = warptile[0] / warptile[10];
+ 
+@@ -4019,6 +4131,8 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
+         case GGML_TYPE_Q5_1:    block_a_size = std430_size({{16, 4}, {4, 4}, {fp2_size, fp2_align}});         break; // qs[16/4] + qh + dm(vec2)
+         case GGML_TYPE_Q8_0:    block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + dm
+         case GGML_TYPE_MXFP4:   block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});                  break; // qs[8] + d
++        case GGML_TYPE_Q4_0_ROCMFP4:      block_a_size = std430_size({{32, 4}, {fp2_size, fp2_align}});         break; // qs[8] + d(vec2)
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST: block_a_size = std430_size({{32, 4}, {fp_size,  fp_align}});         break; // qs[8] + d
+         case GGML_TYPE_Q2_K:    block_a_size = std430_size({{ 8, 4}, {2, 2}, {fp2_size, fp2_align}});         break; // qs[2] + scales(u8vec2) + dm(vec2)
+         case GGML_TYPE_Q3_K:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[4] + d_scales(vec2)
+         case GGML_TYPE_Q4_K:    block_a_size = std430_size({{16, 4}, {fp2_size, fp2_align}});                 break; // qs[4] + dm(vec2)
+@@ -4124,6 +4238,11 @@ static bool ggml_vk_fa_type_needs_shmem(ggml_type type) {
+     switch (type) {
+     case GGML_TYPE_IQ4_NL:
+         return true;
++    case GGML_TYPE_Q4_0_ROCMFP4:
++    case GGML_TYPE_Q6_0_ROCMFPX:
++    case GGML_TYPE_Q3_0_ROCMFPX:
++        // codebook and/or the UE4M3 scale table
++        return true;
+     default:
+         return false;
+     }
+@@ -4588,10 +4707,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
+         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
+-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+-            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+-            spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
+-            spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
++        const uint32_t pad = ggml_vk_coopmat_shmem_pad(device, spec[3]);  // spec[3] is the warptile BK
++        const bool intel_slm = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
++                               device->driver_id == vk::DriverId::eIntelProprietaryWindows;
++        if (intel_slm || pad != 4) {
++            spec.push_back(pad);                  // constantID=12: SHMEM_STRIDE_PAD
++            spec.push_back(intel_slm ? 1u : 0u);  // constantID=13: APPLY_SLM_A_RESHAPE
+         }
+         return spec;
+     };
+@@ -4654,6 +4775,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_S],   matmul_iq3_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_XS],  matmul_iq4_xs_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_NL],  matmul_iq4_nl_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_0_ROCMFP4],  matmul_rocmfp4_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_rocmfp4_fast_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q3_0_ROCMFPX],  matmul_rocmfpx_fp3_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_0_ROCMFPX],  matmul_rocmfpx_fp6_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q8_0_ROCMFPX],  matmul_rocmfpx_fp8_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+ #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
+         if (device->ocp_fp4) {
+             CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_MXFP4],   matmul_mxfp4_f16_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+@@ -4695,6 +4821,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S],   matmul_id_subgroup_iq3_s_f16,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
+         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS],  matmul_id_subgroup_iq4_xs_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
+         CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4],  matmul_id_subgroup_rocmfp4_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_id_subgroup_rocmfp4_fast_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp3_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp6_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
++        CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp8_f16,  mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
+ #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
+         if (device->ocp_fp4) {
+             CREATE_MM2(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f16_ocp,   mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 5)
+@@ -4711,20 +4842,87 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #endif  // defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+ #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+     if (device->coopmat_support) {
++        // RDNA3.x WMMA is wave32 native, so a wave64 subgroup issues each coopmat op as two
++        // halves. Keep BLOCK_SIZE and set WARP to 32: the subgroup count doubles and WM (or WN)
++        // halves until the warp grid tiles BM x BN again, so the per lane accumulator footprint
++        // is unchanged. The win tracks the inline dequant instruction count, so it lands on the
++        // issue-bound quantised kernels, not on the float ones which are bandwidth-bound on the
++        // weight stream.
++        //
++        // The cm1 shaders derive their warp grid from gl_SubgroupID and size shared arrays as
++        // NUM_WARPS = BLOCK_SIZE / WARP, so WARP and the real subgroup must agree. Push the
++        // tile's own WARP as the required subgroup size instead of leaving it to the driver.
++        //
++        // GGML_VK_DENSE_WAVE32=0 disables, =2 also retiles the float tiles.
++        const bool dense_sgs_scope =
++            device->vendor_id == VK_VENDOR_ID_AMD &&
++            device->driver_id != vk::DriverId::eAmdProprietary &&
++            device->subgroup_size_control;
++        const bool dense_wave32_possible =
++            dense_sgs_scope &&
++            device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size &&
++            device->subgroup_size > 32;
++        static const int dense_wave32 = [] {
++            const char * e = getenv("GGML_VK_DENSE_WAVE32");
++            return e ? atoi(e) : 0;  // off by default until measured here
++        }();
++
++        const bool dense_wave32_active = dense_wave32_possible && dense_wave32 != 0;
++
++        // Set one warptile field, then halve WM (or WN) until the warp grid tiles BM x BN again.
++        // Leaves the tile alone if no legal grid exists.
++        // {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}
++        auto retile = [](std::vector<uint32_t> & w, size_t idx, uint32_t val) {
++            std::vector<uint32_t> t = w;
++            t[idx] = val;
++            for (int guard = 0; guard < 4 && t[0] / t[10] != (t[1] / t[4]) * (t[2] / t[5]); ++guard) {
++                if (t[4] >= t[5] && t[4] > t[7]) {
++                    t[4] /= 2;  // halve WM, keeping WM >= TM
++                } else {
++                    t[5] /= 2;  // halve WN
++                }
++            }
++            if (t[0] / t[10] != (t[1] / t[4]) * (t[2] / t[5]) || t[4] < t[7] || t[5] < t[8]) {
++                return;
++            }
++            w = t;
++        };
++
++        if (dense_wave32_active) {
++            retile(l_warptile_mmq, 10, 32);
++            retile(m_warptile_mmq, 10, 32);
++            retile(s_warptile_mmq, 10, 32);
++            if (dense_wave32 >= 2) {
++                retile(l_warptile, 10, 32);
++                retile(m_warptile, 10, 32);
++                retile(s_warptile, 10, 32);
++            }
++        }
++
++        // WARP -> required subgroup size. Only pinned when the retile ran, so with the gate off
++        // the pipelines keep the driver default and stay identical to upstream.
++        auto dense_req_sgs = [dense_wave32_active, &device](const std::vector<uint32_t> & w) -> uint32_t {
++            const uint32_t warp = w[10];
++            if (!dense_wave32_active || warp < device->subgroup_min_size || warp > device->subgroup_max_size) {
++                return 0;
++            }
++            return warp;
++        };
++
+         // Create 6 variants, {s,m,l}x{unaligned,aligned}
+ #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
+         if (device->mul_mat ## ID ## _l[TYPE]) \
+-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true);   \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, dense_req_sgs(l_ ## WARPTILE));   \
+         if (device->mul_mat ## ID ## _m[TYPE]) \
+-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true);   \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, dense_req_sgs(m_ ## WARPTILE));   \
+         if (device->mul_mat ## ID ## _s[TYPE]) \
+-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true);   \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, dense_req_sgs(s_ ## WARPTILE));   \
+         if (device->mul_mat ## ID ## _l[TYPE]) \
+-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true);   \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(l_ ## WARPTILE));   \
+         if (device->mul_mat ## ID ## _m[TYPE]) \
+-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true);   \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, dense_req_sgs(m_ ## WARPTILE));   \
+         if (device->mul_mat ## ID ## _s[TYPE]) \
+-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true);   \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, dense_req_sgs(s_ ## WARPTILE));   \
+ 
+         // Create 2 variants, {f16,f32} accumulator
+ #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
+@@ -4768,6 +4966,26 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_MM2(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ3_S],   matmul_iq3_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+         CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ4_XS],  matmul_iq4_xs_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+         CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ4_NL],  matmul_iq4_nl_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4],  matmul_rocmfp4_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_rocmfp4_fast_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_0_ROCMFPX],  matmul_rocmfpx_fp3_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_0_ROCMFPX],  matmul_rocmfpx_fp6_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q8_0_ROCMFPX],  matmul_rocmfpx_fp8_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++
++        // f16-B variants of the same quant pipelines. The _f16 SPIR-V is already built for every
++        // type; upstream only instantiates it in the coopmat2 branch.
++        if (ggml_vk_dense_f16b_enabled()) {
++        CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_0], matmul_q4_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_1], matmul_q4_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_0], matmul_q5_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_1], matmul_q5_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q8_0], matmul_q8_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_K], matmul_q2_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q3_K], matmul_q3_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K], matmul_q4_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_K], matmul_q5_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_K], matmul_q6_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
++        }
+ 
+ #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
+         if (device->ocp_fp4) {
+@@ -4782,6 +5000,40 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+         GGML_ASSERT(device->subgroup_ballot);
+ 
++        // The mmid quant pipelines share the dense warptile_mmq tiles. Shadow them so the
++        // MoE knobs can move the mul_mat_id tiles without touching dense.
++        auto l_warptile_mmq_id = l_warptile_mmq;
++        auto m_warptile_mmq_id = m_warptile_mmq;
++        auto s_warptile_mmq_id = s_warptile_mmq;
++        uint32_t mmid_req_sgs = 0;
++        {
++            // GGML_VK_MMID_WG256=1: the dense large tile runs 256 threads on its 128x128 tile but
++            // the medium mul_mat_id tile still runs 128. Same BM/BN/BK, so same shared memory,
++            // twice the threads sharing each A/B tile load, half the accumulators per thread. A
++            // 256-expert MoE at ub2048 leaves ~64 rows per expert, so the medium tile is the one
++            // that runs.
++            static const bool mmid_wg256 = [] {
++                const char * e = getenv("GGML_VK_MMID_WG256");
++                return e && atoi(e) != 0;
++            }();
++            if (mmid_wg256) {
++                retile(l_warptile_mmq_id, 0, 256);
++                retile(m_warptile_mmq_id, 0, 256);
++            }
++            // GGML_VK_MMID_WAVE32=1: same wave32 retile as the dense path, for mul_mat_id.
++            static const bool mmid_wave32_env = [] {
++                const char * e = getenv("GGML_VK_MMID_WAVE32");
++                return e && atoi(e) != 0;
++            }();
++            if (mmid_wave32_env && device->subgroup_size_control &&
++                device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
++                mmid_req_sgs = 32;
++                retile(l_warptile_mmq_id, 10, 32);
++                retile(m_warptile_mmq_id, 10, 32);
++                retile(s_warptile_mmq_id, 10, 32);
++            }
++        }
++
+         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_id_f32, matmul_id_subgroup_f32_f32, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_id_f16, matmul_id_subgroup_f16, wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_id_f16_f32, matmul_id_subgroup_f16_f32, wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+@@ -4791,6 +5043,27 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         }
+ #endif
+ 
++        {
++        const auto & l_warptile_mmq = l_warptile_mmq_id;
++        const auto & m_warptile_mmq = m_warptile_mmq_id;
++        const auto & s_warptile_mmq = s_warptile_mmq_id;
++
++        // Same expansion as CREATE_MM above, plus the required subgroup size for MMID_WAVE32.
++#undef CREATE_MM
++#define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
++        if (device->mul_mat ## ID ## _l[TYPE]) \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
++        if (device->mul_mat ## ID ## _m[TYPE]) \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
++        if (device->mul_mat ## ID ## _s[TYPE]) \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
++        if (device->mul_mat ## ID ## _l[TYPE]) \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mmid_req_sgs);   \
++        if (device->mul_mat ## ID ## _m[TYPE]) \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, mmid_req_sgs);   \
++        if (device->mul_mat ## ID ## _s[TYPE]) \
++            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mmid_req_sgs);   \
++
+         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+@@ -4813,6 +5086,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_MM2(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S],   matmul_id_subgroup_iq3_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS],  matmul_id_subgroup_iq4_xs_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4],  matmul_id_subgroup_rocmfp4_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_id_subgroup_rocmfp4_fast_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp3_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp6_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp8_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+ #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
+         if (device->ocp_fp4) {
+             CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+@@ -4823,6 +5101,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+             CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         }
++
++        // f16-B variants of the same quant matmul_id pipelines. The _f16 SPIR-V is already built
++        // for every type; upstream only instantiates it in the coopmat2 branch.
++        if (ggml_vk_mmid_f16b_enabled()) {
++        CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        }
++        }
+ #undef CREATE_MM2
+ #undef CREATE_MM
+     } else
+@@ -4904,6 +5198,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_MM2(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ3_S],   matmul_iq3_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ4_XS],  matmul_iq4_xs_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ4_NL],  matmul_iq4_nl_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4],  matmul_rocmfp4_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_rocmfp4_fast_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM2(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_0_ROCMFPX],  matmul_rocmfpx_fp3_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM2(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_0_ROCMFPX],  matmul_rocmfpx_fp6_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM2(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q8_0_ROCMFPX],  matmul_rocmfpx_fp8_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat[GGML_TYPE_MXFP4],   matmul_mxfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat[GGML_TYPE_NVFP4],   matmul_nvfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+ 
+@@ -4917,6 +5216,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             CREATE_MMQ(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q8_0], matmul_q8_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+ 
+             CREATE_MMQ(GGML_TYPE_MXFP4, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_MXFP4], matmul_mxfp4_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4], matmul_rocmfp4_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
++            CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST], matmul_rocmfp4_fast_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+ 
+             CREATE_MMQ(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q2_K], matmul_q2_k_q8_1, mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, , 0);
+             CREATE_MMQ(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q3_K], matmul_q3_k_q8_1, mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, , 0);
+@@ -4953,6 +5254,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             CREATE_MM2(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S],   matmul_id_subgroup_iq3_s_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS],  matmul_id_subgroup_iq4_xs_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4],  matmul_id_subgroup_rocmfp4_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_id_subgroup_rocmfp4_fast_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM2(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp3_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM2(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp6_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM2(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp8_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+ 
+@@ -4966,6 +5272,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 CREATE_MMQ(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+ 
+                 CREATE_MMQ(GGML_TYPE_MXFP4, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_MXFP4], matmul_id_subgroup_mxfp4_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++                CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4], matmul_id_subgroup_rocmfp4_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++                CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST], matmul_id_subgroup_rocmfp4_fast_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+ 
+                 CREATE_MMQ(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_q8_1, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
+                 CREATE_MMQ(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_q8_1, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
+@@ -5001,6 +5309,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             CREATE_MM2(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S],   matmul_id_iq3_s_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS],  matmul_id_iq4_xs_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_iq4_nl_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4],  matmul_id_rocmfp4_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_id_rocmfp4_fast_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM2(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX],  matmul_id_rocmfpx_fp3_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM2(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX],  matmul_id_rocmfpx_fp6_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM2(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX],  matmul_id_rocmfpx_fp8_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_mxfp4_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_nvfp4_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+ 
+@@ -5014,6 +5327,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 CREATE_MMQ(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q8_0], matmul_id_q8_0_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+ 
+                 CREATE_MMQ(GGML_TYPE_MXFP4, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_MXFP4], matmul_id_mxfp4_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++                CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4], matmul_id_rocmfp4_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++                CREATE_MMQ(GGML_TYPE_Q4_0_ROCMFP4_FAST, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q4_0_ROCMFP4_FAST], matmul_id_rocmfp4_fast_q8_1, mmq_wg_denoms, warptile_mmqid_int,   vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+ 
+                 CREATE_MMQ(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q2_K], matmul_id_q2_k_q8_1, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+                 CREATE_MMQ(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id_q8_1[GGML_TYPE_Q3_K], matmul_id_q3_k_q8_1, mmq_wg_denoms, warptile_mmqid_int_k, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+@@ -5081,6 +5396,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_MM(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ3_S].f32acc,   matmul_iq3_s_f32,   , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ4_XS].f32acc,  matmul_iq4_xs_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ4_NL].f32acc,  matmul_iq4_nl_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4].f32acc,  matmul_rocmfp4_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc,  matmul_rocmfp4_fast_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_0_ROCMFPX].f32acc,  matmul_rocmfpx_fp3_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_0_ROCMFPX].f32acc,  matmul_rocmfpx_fp6_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
++        CREATE_MM(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat[GGML_TYPE_Q8_0_ROCMFPX].f32acc,  matmul_rocmfpx_fp8_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat[GGML_TYPE_MXFP4].f32acc,   matmul_mxfp4_f32,   , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+         CREATE_MM(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat[GGML_TYPE_NVFP4].f32acc,   matmul_nvfp4_f32,   , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+ 
+@@ -5129,6 +5449,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             CREATE_MM(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S].f32acc,   matmul_id_subgroup_iq3_s_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS].f32acc,  matmul_id_subgroup_iq4_xs_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL].f32acc,  matmul_id_subgroup_iq4_nl_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4].f32acc,  matmul_id_subgroup_rocmfp4_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc,  matmul_id_subgroup_rocmfp4_fast_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX].f32acc,  matmul_id_subgroup_rocmfpx_fp3_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX].f32acc,  matmul_id_subgroup_rocmfpx_fp6_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
++            CREATE_MM(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX].f32acc,  matmul_id_subgroup_rocmfpx_fp8_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4].f32acc,   matmul_id_subgroup_mxfp4_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+             CREATE_MM(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4].f32acc,   matmul_id_subgroup_nvfp4_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size);
+         } else {
+@@ -5159,6 +5484,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             CREATE_MM(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S].f32acc,   matmul_id_iq3_s_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS].f32acc,  matmul_id_iq4_xs_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL].f32acc,  matmul_id_iq4_nl_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4].f32acc,  matmul_id_rocmfp4_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST].f32acc,  matmul_id_rocmfp4_fast_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX].f32acc,  matmul_id_rocmfpx_fp3_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX].f32acc,  matmul_id_rocmfpx_fp6_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
++            CREATE_MM(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX].f32acc,  matmul_id_rocmfpx_fp8_f32,  , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4].f32acc,   matmul_id_mxfp4_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+             CREATE_MM(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4].f32acc,   matmul_id_nvfp4_f32,   , mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+         }
+@@ -5263,6 +5593,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ3_S][i],   "mul_mat_vec_iq3_s_f32_f32",   arr_dmmv_iq3_s_f32_f32_len[reduc16],   arr_dmmv_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_XS][i],  "mul_mat_vec_iq4_xs_f32_f32",  arr_dmmv_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f32_f32",  arr_dmmv_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i],  "mul_mat_vec_rocmfp4_f32_f32",  arr_dmmv_rocmfp4_f32_f32_len[reduc16],  arr_dmmv_rocmfp4_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i],  "mul_mat_vec_rocmfp4_fast_f32_f32",  arr_dmmv_rocmfp4_fast_f32_f32_len[reduc16],  arr_dmmv_rocmfp4_fast_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp3_f32_f32",  arr_dmmv_rocmfpx_fp3_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp3_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q6_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp6_f32_f32",  arr_dmmv_rocmfpx_fp6_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp6_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp8_f32_f32",  arr_dmmv_rocmfpx_fp8_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp8_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f32_f32",   OCP_DMMV_LEN(arr_dmmv_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f32_f32",   OCP_DMMV_LEN(arr_dmmv_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+ 
+@@ -5291,6 +5626,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ3_S][i],   "mul_mat_vec_iq3_s_f16_f32",   arr_dmmv_iq3_s_f16_f32_len[reduc16],   arr_dmmv_iq3_s_f16_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ4_XS][i],  "mul_mat_vec_iq4_xs_f16_f32",  arr_dmmv_iq4_xs_f16_f32_len[reduc16],  arr_dmmv_iq4_xs_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f16_f32",  arr_dmmv_iq4_nl_f16_f32_len[reduc16],  arr_dmmv_iq4_nl_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i],  "mul_mat_vec_rocmfp4_f16_f32",  arr_dmmv_rocmfp4_f16_f32_len[reduc16],  arr_dmmv_rocmfp4_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i],  "mul_mat_vec_rocmfp4_fast_f16_f32",  arr_dmmv_rocmfp4_fast_f16_f32_len[reduc16],  arr_dmmv_rocmfp4_fast_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q3_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp3_f16_f32",  arr_dmmv_rocmfpx_fp3_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp3_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q6_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp6_f16_f32",  arr_dmmv_rocmfpx_fp6_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp6_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp8_f16_f32",  arr_dmmv_rocmfpx_fp8_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp8_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f16_f32",   OCP_DMMV_LEN(arr_dmmv_mxfp4_f16_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_mxfp4_f16_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f16_f32",   OCP_DMMV_LEN(arr_dmmv_nvfp4_f16_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_nvfp4_f16_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+ 
+@@ -5307,6 +5647,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i], "mul_mat_vec_rocmfp4_q8_1_f32", arr_dmmv_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i], "mul_mat_vec_rocmfp4_fast_q8_1_f32", arr_dmmv_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i], "mul_mat_vec_rocmfpx_fp8_q8_1_f32", arr_dmmv_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+@@ -5346,6 +5689,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_S],   "mul_mat_vec_id_iq3_s_f32",   arr_dmmv_id_iq3_s_f32_f32_len[reduc16],   arr_dmmv_id_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_XS],  "mul_mat_vec_id_iq4_xs_f32",  arr_dmmv_id_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  arr_dmmv_id_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_id_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0_ROCMFP4],  "mul_mat_vec_id_rocmfp4_f32",  arr_dmmv_id_rocmfp4_f32_f32_len[reduc16],  arr_dmmv_id_rocmfp4_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST],  "mul_mat_vec_id_rocmfp4_fast_f32",  arr_dmmv_id_rocmfp4_fast_f32_f32_len[reduc16],  arr_dmmv_id_rocmfp4_fast_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q3_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp3_f32",  arr_dmmv_id_rocmfpx_fp3_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp3_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q6_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp6_f32",  arr_dmmv_id_rocmfpx_fp6_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp6_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q8_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp8_f32",  arr_dmmv_id_rocmfpx_fp8_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp8_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_MXFP4],   "mul_mat_vec_id_mxfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_NVFP4],   "mul_mat_vec_id_nvfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+ 
+@@ -5362,6 +5710,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0], "mul_mat_vec_id_q8_0_q8_1_f32", arr_dmmv_id_q8_0_q8_1_f32_len[reduc], arr_dmmv_id_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_MXFP4], "mul_mat_vec_id_mxfp4_q8_1_f32", arr_dmmv_id_mxfp4_q8_1_f32_len[reduc], arr_dmmv_id_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4], "mul_mat_vec_id_rocmfp4_q8_1_f32", arr_dmmv_id_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST], "mul_mat_vec_id_rocmfp4_fast_q8_1_f32", arr_dmmv_id_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX], "mul_mat_vec_id_rocmfpx_fp8_q8_1_f32", arr_dmmv_id_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_id_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_K], "mul_mat_vec_id_q2_k_q8_1_f32", arr_dmmv_id_q2_k_q8_1_f32_len[reduc], arr_dmmv_id_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q3_K], "mul_mat_vec_id_q3_k_q8_1_f32", arr_dmmv_id_q3_k_q8_1_f32_len[reduc], arr_dmmv_id_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
+@@ -5409,6 +5760,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ3_S],   "dequant_iq3_s",   dequant_iq3_s_len,   dequant_iq3_s_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_XS],  "dequant_iq4_xs",  dequant_iq4_xs_len,  dequant_iq4_xs_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_0_ROCMFP4],  "dequant_rocmfp4",  dequant_rocmfp4_len,  dequant_rocmfp4_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_0_ROCMFP4_FAST],  "dequant_rocmfp4_fast",  dequant_rocmfp4_fast_len,  dequant_rocmfp4_fast_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q3_0_ROCMFPX],  "dequant_rocmfpx_fp3",  dequant_rocmfpx_fp3_len,  dequant_rocmfpx_fp3_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q6_0_ROCMFPX],  "dequant_rocmfpx_fp6",  dequant_rocmfpx_fp6_len,  dequant_rocmfpx_fp6_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0_ROCMFPX],  "dequant_rocmfpx_fp8",  dequant_rocmfpx_fp8_len,  dequant_rocmfpx_fp8_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_MXFP4],   "dequant_mxfp4",   dequant_mxfp4_len,   dequant_mxfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_NVFP4],   "dequant_nvfp4",   dequant_nvfp4_len,   dequant_nvfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+ 
+@@ -5438,6 +5794,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_IQ3_S],   "get_rows_iq3_s",   get_rows_iq3_s_len,   get_rows_iq3_s_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_IQ4_XS],  "get_rows_iq4_xs",  get_rows_iq4_xs_len,  get_rows_iq4_xs_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_IQ4_NL],  "get_rows_iq4_nl",  get_rows_iq4_nl_len,  get_rows_iq4_nl_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q4_0_ROCMFP4],  "get_rows_rocmfp4",  get_rows_rocmfp4_len,  get_rows_rocmfp4_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q4_0_ROCMFP4_FAST],  "get_rows_rocmfp4_fast",  get_rows_rocmfp4_fast_len,  get_rows_rocmfp4_fast_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q3_0_ROCMFPX],  "get_rows_rocmfpx_fp3",  get_rows_rocmfpx_fp3_len,  get_rows_rocmfpx_fp3_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q6_0_ROCMFPX],  "get_rows_rocmfpx_fp6",  get_rows_rocmfpx_fp6_len,  get_rows_rocmfpx_fp6_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q8_0_ROCMFPX],  "get_rows_rocmfpx_fp8",  get_rows_rocmfpx_fp8_len,  get_rows_rocmfpx_fp8_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_MXFP4],   "get_rows_mxfp4",   get_rows_mxfp4_len,   get_rows_mxfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_NVFP4],   "get_rows_nvfp4",   get_rows_nvfp4_len,   get_rows_nvfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_I32],     "get_rows_i32",     get_rows_i32_len,     get_rows_i32_data,     "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+@@ -5467,6 +5828,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_IQ3_S],   "get_rows_iq3_s_f32",   get_rows_iq3_s_f32_len,   get_rows_iq3_s_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_IQ4_XS],  "get_rows_iq4_xs_f32",  get_rows_iq4_xs_f32_len,  get_rows_iq4_xs_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_IQ4_NL],  "get_rows_iq4_nl_f32",  get_rows_iq4_nl_f32_len,  get_rows_iq4_nl_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q4_0_ROCMFP4],  "get_rows_rocmfp4_f32",  get_rows_rocmfp4_f32_len,  get_rows_rocmfp4_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q4_0_ROCMFP4_FAST],  "get_rows_rocmfp4_fast_f32",  get_rows_rocmfp4_fast_f32_len,  get_rows_rocmfp4_fast_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q3_0_ROCMFPX],  "get_rows_rocmfpx_fp3_f32",  get_rows_rocmfpx_fp3_f32_len,  get_rows_rocmfpx_fp3_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q6_0_ROCMFPX],  "get_rows_rocmfpx_fp6_f32",  get_rows_rocmfpx_fp6_f32_len,  get_rows_rocmfpx_fp6_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q8_0_ROCMFPX],  "get_rows_rocmfpx_fp8_f32",  get_rows_rocmfpx_fp8_f32_len,  get_rows_rocmfpx_fp8_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_MXFP4],   "get_rows_mxfp4_f32",   get_rows_mxfp4_f32_len,   get_rows_mxfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_NVFP4],   "get_rows_nvfp4_f32",   get_rows_nvfp4_f32_len,   get_rows_nvfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
+@@ -5541,6 +5907,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q5_1], "cpy_f32_q5_1", cpy_f32_q5_1_len, cpy_f32_q5_1_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q8_0], "cpy_f32_q8_0", cpy_f32_q8_0_len, cpy_f32_q8_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_IQ4_NL], "cpy_f32_iq4_nl", cpy_f32_iq4_nl_len, cpy_f32_iq4_nl_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_0_ROCMFP4], "cpy_f32_rocmfp4", cpy_f32_rocmfp4_len, cpy_f32_rocmfp4_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_0_ROCMFP4_FAST], "cpy_f32_rocmfp4_fast", cpy_f32_rocmfp4_fast_len, cpy_f32_rocmfp4_fast_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q3_0_ROCMFPX], "cpy_f32_rocmfpx_fp3", cpy_f32_rocmfpx_fp3_len, cpy_f32_rocmfpx_fp3_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q6_0_ROCMFPX], "cpy_f32_rocmfpx_fp6", cpy_f32_rocmfpx_fp6_len, cpy_f32_rocmfpx_fp6_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q8_0_ROCMFPX], "cpy_f32_rocmfpx_fp8", cpy_f32_rocmfpx_fp8_len, cpy_f32_rocmfpx_fp8_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+ 
+ #define SET_ROWS(src_idx, src, itype) \
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_F32],  "set_rows_" #src "_f32" #itype,  set_rows_ ## src ## _f32 ## itype ## _len,  set_rows_ ## src ## _f32 ## itype ## _data,  "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+@@ -5553,7 +5924,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_0], "set_rows_" #src "_q5_0" #itype, set_rows_ ## src ## _q5_0 ## itype ## _len, set_rows_ ## src ## _q5_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_1], "set_rows_" #src "_q5_1" #itype, set_rows_ ## src ## _q5_1 ## itype ## _len, set_rows_ ## src ## _q5_1 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q8_0], "set_rows_" #src "_q8_0" #itype, set_rows_ ## src ## _q8_0 ## itype ## _len, set_rows_ ## src ## _q8_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q4_0_ROCMFP4], "set_rows_" #src "_rocmfp4" #itype, set_rows_ ## src ## _rocmfp4 ## itype ## _len, set_rows_ ## src ## _rocmfp4 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q4_0_ROCMFP4_FAST], "set_rows_" #src "_rocmfp4_fast" #itype, set_rows_ ## src ## _rocmfp4_fast ## itype ## _len, set_rows_ ## src ## _rocmfp4_fast ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q3_0_ROCMFPX], "set_rows_" #src "_rocmfpx_fp3" #itype, set_rows_ ## src ## _rocmfpx_fp3 ## itype ## _len, set_rows_ ## src ## _rocmfpx_fp3 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q6_0_ROCMFPX], "set_rows_" #src "_rocmfpx_fp6" #itype, set_rows_ ## src ## _rocmfpx_fp6 ## itype ## _len, set_rows_ ## src ## _rocmfpx_fp6 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q8_0_ROCMFPX], "set_rows_" #src "_rocmfpx_fp8" #itype, set_rows_ ## src ## _rocmfpx_fp8 ## itype ## _len, set_rows_ ## src ## _rocmfpx_fp8 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+ 
+     SET_ROWS(0, f32, _i32)
+     SET_ROWS(0, f32, _i64)
+@@ -5570,6 +5946,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q5_1], "cpy_q5_1_f32", cpy_q5_1_f32_len, cpy_q5_1_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q5_1), 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q8_0], "cpy_q8_0_f32", cpy_q8_0_f32_len, cpy_q8_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q8_0), 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_IQ4_NL], "cpy_iq4_nl_f32", cpy_iq4_nl_f32_len, cpy_iq4_nl_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_IQ4_NL), 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0_ROCMFP4], "cpy_rocmfp4_f32", cpy_rocmfp4_f32_len, cpy_rocmfp4_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0_ROCMFP4), 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0_ROCMFP4_FAST], "cpy_rocmfp4_fast_f32", cpy_rocmfp4_fast_f32_len, cpy_rocmfp4_fast_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0_ROCMFP4_FAST), 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q3_0_ROCMFPX], "cpy_rocmfpx_fp3_f32", cpy_rocmfpx_fp3_f32_len, cpy_rocmfpx_fp3_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q3_0_ROCMFPX), 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q6_0_ROCMFPX], "cpy_rocmfpx_fp6_f32", cpy_rocmfpx_fp6_f32_len, cpy_rocmfpx_fp6_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q6_0_ROCMFPX), 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q8_0_ROCMFPX], "cpy_rocmfpx_fp8_f32", cpy_rocmfpx_fp8_f32_len, cpy_rocmfpx_fp8_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q8_0_ROCMFPX), 1, 1}, {}, 1);
+ 
+     auto get_suffix = [](bool src0_f16, bool src1_f16, bool dst_f16) {
+         std::string s;
+@@ -5613,6 +5994,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_i32, "concat_transpose_i32", concat_transpose_i32_len, concat_transpose_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
+@@ -7670,6 +8052,11 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        case GGML_TYPE_Q3_0_ROCMFPX:
++        case GGML_TYPE_Q6_0_ROCMFPX:
++        case GGML_TYPE_Q8_0_ROCMFPX:
+         case GGML_TYPE_TQ2_0:
+             break;
+         default:
+@@ -7717,7 +8104,8 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
+         return pipelines;
+     }
+ 
+-    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2) {
++    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2 &&
++        !(src1_type == GGML_TYPE_F16 && ggml_vk_dense_f16b_enabled())) {
+         return nullptr;
+     }
+ 
+@@ -7745,6 +8133,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        case GGML_TYPE_Q3_0_ROCMFPX:
++        case GGML_TYPE_Q6_0_ROCMFPX:
++        case GGML_TYPE_Q8_0_ROCMFPX:
+         case GGML_TYPE_TQ2_0:
+             break;
+         default:
+@@ -7756,7 +8149,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
+         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
+     }
+     if (ctx->device->coopmat_support) {
+-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
++        vk_matmul_pipeline2 & p = (src1_type == GGML_TYPE_F16) ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type]
++                                                              : ctx->device->pipeline_dequant_mul_mat_mat[src0_type];
++        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? p.f16acc : p.f32acc;
+     }
+     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+ }
+@@ -7775,6 +8170,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+             case GGML_TYPE_Q5_1:
+             case GGML_TYPE_Q8_0:
+             case GGML_TYPE_MXFP4:
++            case GGML_TYPE_Q4_0_ROCMFP4:
++            case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++            case GGML_TYPE_Q8_0_ROCMFPX:
+             case GGML_TYPE_Q2_K:
+             case GGML_TYPE_Q3_K:
+             case GGML_TYPE_Q4_K:
+@@ -7815,6 +8213,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        case GGML_TYPE_Q3_0_ROCMFPX:
++        case GGML_TYPE_Q6_0_ROCMFPX:
++        case GGML_TYPE_Q8_0_ROCMFPX:
+         case GGML_TYPE_TQ2_0:
+             break;
+         default:
+@@ -7883,7 +8286,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
+         return pipelines;
+     }
+ 
+-    GGML_ASSERT(src1_type == GGML_TYPE_F32 || (ctx->device->coopmat2 && src1_type == GGML_TYPE_F16));
++    const bool mmid_f16b = src1_type == GGML_TYPE_F16 && ggml_vk_mmid_f16b_enabled() && !ctx->device->coopmat2;
++
++    GGML_ASSERT(src1_type == GGML_TYPE_F32 || mmid_f16b || (ctx->device->coopmat2 && src1_type == GGML_TYPE_F16));
+ 
+     switch (src0_type) {
+         case GGML_TYPE_Q1_0:
+@@ -7909,13 +8314,19 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        case GGML_TYPE_Q3_0_ROCMFPX:
++        case GGML_TYPE_Q6_0_ROCMFPX:
++        case GGML_TYPE_Q8_0_ROCMFPX:
+         case GGML_TYPE_TQ2_0:
+             break;
+         default:
+             return nullptr;
+     }
+ 
+-    vk_matmul_pipeline2& mmp = ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
++    vk_matmul_pipeline2& mmp = mmid_f16b ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0_type]
++                                         : ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
+     // XXX TODO 'prec' is not actually allowed in mul_mat_id.
+     bool prefer_fp16acc = ctx->device->fp16 /*&& prec == GGML_PREC_DEFAULT*/;
+     bool support_fp16acc = !mmp.f16acc->is_empty();
+@@ -7942,6 +8353,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+             case GGML_TYPE_Q5_1:
+             case GGML_TYPE_Q8_0:
+             case GGML_TYPE_MXFP4:
++            case GGML_TYPE_Q4_0_ROCMFP4:
++            case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++            case GGML_TYPE_Q8_0_ROCMFPX:
+             case GGML_TYPE_Q2_K:
+             case GGML_TYPE_Q3_K:
+             case GGML_TYPE_Q4_K:
+@@ -7982,6 +8396,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+         case GGML_TYPE_IQ4_NL:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        case GGML_TYPE_Q3_0_ROCMFPX:
++        case GGML_TYPE_Q6_0_ROCMFPX:
++        case GGML_TYPE_Q8_0_ROCMFPX:
+         case GGML_TYPE_TQ2_0:
+             break;
+         default:
+@@ -8599,7 +9018,13 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
+     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
+     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
+     // the HW device to host copy path.
+-    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma) {
++    // On UMA a direct CPU read is only fast from a host-cached mapping. A write-combined mapping
++    // (host-visible without HOST_CACHED, which is what amdgpu gives for GTT) reads back at
++    // uncached speed, so bulk reads must use the device copy path. Small reads stay direct to
++    // avoid the fence round trip.
++    const bool host_cached = bool(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
++    if((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && src->device->uma &&
++       (host_cached || width * height <= 64 * 1024)) {
+         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+ 
+         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+@@ -9017,6 +9442,11 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
+         case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_IQ4_NL:
++        case GGML_TYPE_Q4_0_ROCMFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        case GGML_TYPE_Q3_0_ROCMFPX:
++        case GGML_TYPE_Q6_0_ROCMFPX:
++        case GGML_TYPE_Q8_0_ROCMFPX:
+             return ctx->device->pipeline_cpy_f32_quant[to];
+         default:
+             break;
+@@ -9033,6 +9463,11 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
+         case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_IQ4_NL:
++        case GGML_TYPE_Q4_0_ROCMFP4:
++        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++        case GGML_TYPE_Q3_0_ROCMFPX:
++        case GGML_TYPE_Q6_0_ROCMFPX:
++        case GGML_TYPE_Q8_0_ROCMFPX:
+             return ctx->device->pipeline_cpy_quant_f32[src->type];
+         default:
+             break;
+@@ -9209,7 +9644,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
+     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+                               !ggml_vk_dim01_contiguous(src0);
+-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
++    // Route quantized MUL_MAT through the f16-B kernels. Treating contiguous f32 B as
++    // y_non_contig reuses the convert-to-prealloc_y plumbing, the same way coopmat2 does.
++    const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
++                            (ggml_vk_dense_f16b_mode() == 1 || ne10 == 5120) &&
++                            ctx->device->coopmat_support && !ctx->device->coopmat2 &&
++                            ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
++                            !(ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f16acc->is_empty() &&
++                              ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f32acc->is_empty());
++    const bool y_non_contig = dense_f16b ||
++                              (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                               !ggml_vk_dim01_contiguous(src1);
+ 
+@@ -10145,7 +10589,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+ #else
+     const bool y_decode_vector_staging = false;
+ #endif
+-    const bool y_non_contig = y_decode_vector_staging ||
++    // Route quantized MUL_MAT_ID through the f16-B kernels. Treating contiguous f32 B as
++    // y_non_contig reuses the convert-to-prealloc_y plumbing, the same way coopmat2 does.
++    const bool mmid_f16b = ggml_vk_mmid_f16b_enabled() &&
++                           ctx->device->coopmat_support && !ctx->device->coopmat2 &&
++                           ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
++                           !(ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0->type].f16acc->is_empty() &&
++                             ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0->type].f32acc->is_empty());
++    const bool y_non_contig = mmid_f16b ||
++                              y_decode_vector_staging ||
+                               (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                               !ggml_vk_dim01_contiguous(src1);
+@@ -11250,6 +11702,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         if (!ggml_vk_concat_supported(src0, src1, dst)) {
+             return nullptr;
+         }
++        if (ggml_vk_concat_is_transposed(src0, src1, dst)) {
++            // The tiled kernel has no grid-stride loop, so it needs the whole grid in one dispatch.
++            const auto & max_wg = ctx->device->properties.limits.maxComputeWorkGroupCount;
++            if ((uint64_t) CEIL_DIV(dst->ne[1], 32) <= max_wg[0] &&
++                (uint64_t) CEIL_DIV(src1->ne[0], 32) <= max_wg[1]) {
++                return ctx->device->pipeline_concat_transpose_i32;
++            }
++        }
+         switch (ggml_vk_concat_unit_size(src0->type)) {
+         case 1:
+             return ctx->device->pipeline_concat_i8;
+@@ -12284,7 +12744,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+                 elements = { ne, 1, 1 };
+             }
+ 
+-            if (pipeline == ctx->device->pipeline_cpy_transpose_02_32 ||
++            if (pipeline == ctx->device->pipeline_concat_transpose_i32) {
++                // 32x32 tiles: x over the shared row axis, y over src1's transposed width
++                elements[0] = (uint32_t)CEIL_DIV(dst->ne[1], 32);
++                elements[1] = (uint32_t)CEIL_DIV(src1->ne[0], 32);
++                elements[2] = 1;
++            } else if (pipeline == ctx->device->pipeline_cpy_transpose_02_32 ||
+                 pipeline == ctx->device->pipeline_cpy_transpose_02_16) {
+                 // 32x32 tiles over dims 0 and 2; dim1 and dim3 are the batch
+                 elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
+@@ -15587,6 +16052,22 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+             break;
+         }
+ 
++        // Fused silu(x)*y: run it as a swiglu split, writing straight to the MUL's destination.
++        if (ctx->num_additional_fused_ops == 1) {
++            ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
++            ggml_tensor * other = (mul->src[0] == node) ? mul->src[1] : mul->src[0];
++
++            ggml_tensor fused = *mul;
++            fused.op = GGML_OP_GLU;
++            memset(fused.op_params, 0, sizeof(fused.op_params));
++            ggml_set_op_params_i32(&fused, 0, (int32_t) GGML_GLU_OP_SWIGLU);
++            fused.src[0] = node->src[0];
++            fused.src[1] = other;
++
++            ggml_vk_glu(ctx, compute_ctx, fused.src[0], fused.src[1], &fused);
++            break;
++        }
++
+         switch (ggml_get_unary_op(node)) {
+         case GGML_UNARY_OP_ELU:
+         case GGML_UNARY_OP_EXP:
+@@ -16526,6 +17007,40 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
+         return false;
+     }
+ 
++    // GGML_VK_FUSE_UNARY_MUL=1: the delta-net path emits silu(x)*y as two nodes, so the silu
++    // result makes a full round trip through memory. That is the same shape the swiglu split
++    // already computes in one pass, so route the pair to the existing GLU pipeline.
++    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
++        static const bool enabled = [] {
++            const char * e = getenv("GGML_VK_FUSE_UNARY_MUL");
++            return e && atoi(e) != 0;
++        }();
++        if (!enabled) {
++            return false;
++        }
++        const ggml_tensor * unary = cgraph->nodes[node_idx];
++        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
++
++        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU) {
++            return false;
++        }
++        if (mul->src[0] != unary && mul->src[1] != unary) {
++            return false;
++        }
++        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
++        // The GLU split shader walks both inputs and the output with the same element count.
++        if (unary->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
++            return false;
++        }
++        if (!ggml_are_same_shape(unary, other) || !ggml_are_same_shape(unary, mul)) {
++            return false;
++        }
++        if (!ggml_is_contiguous(unary->src[0]) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) {
++            return false;
++        }
++        return true;
++    }
++
+     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+         // additional constraints specific to this fusion
+         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+@@ -17254,6 +17769,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 fusion_string = "MUL_MAT_ID_MUL";
+                 op_srcs_fused_elementwise[0] = false;
+                 op_srcs_fused_elementwise[1] = true;
++            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
++                ctx->num_additional_fused_ops = 1;
++                fusion_string = "SILU_MUL";
+             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
+                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
+                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
+@@ -18161,6 +18679,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_NVFP4:
++                    case GGML_TYPE_Q4_0_ROCMFP4:
++                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++                    case GGML_TYPE_Q3_0_ROCMFPX:
++                    case GGML_TYPE_Q6_0_ROCMFPX:
++                    case GGML_TYPE_Q8_0_ROCMFPX:
+                     case GGML_TYPE_TQ2_0:
+                         break;
+                     default:
+@@ -18210,7 +18733,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
+                     return false;
+                 }
+-                auto fa_kv_ok = [](ggml_type t) {
++                auto fa_kv_ok = [coopmat2](ggml_type t) {
+                     switch (t) {
+                     case GGML_TYPE_F32:
+                     case GGML_TYPE_F16:
+@@ -18222,6 +18745,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_Q4_0:
+                     case GGML_TYPE_IQ4_NL:
+                         return true;
++                    case GGML_TYPE_Q4_0_ROCMFP4:
++                    case GGML_TYPE_Q6_0_ROCMFPX:
++                    case GGML_TYPE_Q3_0_ROCMFPX:
++                        // decode lives in flash_attn_dequant.glsl, which only the
++                        // scalar and coopmat1 shaders include. coopmat2 has its own
++                        // buffer_reference decode path that is not wired up for the
++                        // ROCmFPx types yet, and would silently return zeros.
++                        return !coopmat2;
+                     default:
+                         return false;
+                     }
+@@ -18267,6 +18798,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_IQ4_NL:
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_NVFP4:
++                    case GGML_TYPE_Q4_0_ROCMFP4:
++                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++                    case GGML_TYPE_Q3_0_ROCMFPX:
++                    case GGML_TYPE_Q6_0_ROCMFPX:
++                    case GGML_TYPE_Q8_0_ROCMFPX:
+                     case GGML_TYPE_TQ2_0:
+                     case GGML_TYPE_I32:
+                         return true;
+@@ -18294,6 +18830,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_Q5_1:
+                     case GGML_TYPE_Q8_0:
+                     case GGML_TYPE_IQ4_NL:
++                    case GGML_TYPE_Q4_0_ROCMFP4:
++                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++                    case GGML_TYPE_Q3_0_ROCMFPX:
++                    case GGML_TYPE_Q6_0_ROCMFPX:
++                    case GGML_TYPE_Q8_0_ROCMFPX:
+                         return true;
+                     default:
+                         return false;
+@@ -18319,6 +18860,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_Q5_1:
+                     case GGML_TYPE_Q8_0:
+                     case GGML_TYPE_IQ4_NL:
++                    case GGML_TYPE_Q4_0_ROCMFP4:
++                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++                    case GGML_TYPE_Q3_0_ROCMFPX:
++                    case GGML_TYPE_Q6_0_ROCMFPX:
++                    case GGML_TYPE_Q8_0_ROCMFPX:
+                         return true;
+                     default:
+                         break;
+@@ -18336,6 +18882,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     case GGML_TYPE_Q5_1:
+                     case GGML_TYPE_Q8_0:
+                     case GGML_TYPE_IQ4_NL:
++                    case GGML_TYPE_Q4_0_ROCMFP4:
++                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++                    case GGML_TYPE_Q3_0_ROCMFPX:
++                    case GGML_TYPE_Q6_0_ROCMFPX:
++                    case GGML_TYPE_Q8_0_ROCMFPX:
+                         return true;
+                     default:
+                         break;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/concat_transpose.comp b/ggml/src/ggml-vulkan/vulkan-shaders/concat_transpose.comp
+new file mode 100644
+index 000000000..801105759
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/concat_transpose.comp
+@@ -0,0 +1,43 @@
++#version 450
++
++#include "types.glsl"
++#include "generic_binary_head.glsl"
++
++layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
++
++// dim-0 concat whose src1 is transposed. The generic kernel reads src1 with the transposed
++// stride, so neighbouring lanes touch different cache lines. Stage a 32x32 tile in shared
++// memory instead, which keeps both the load and the store coalesced. 33 columns pads away
++// the shared memory bank conflicts.
++shared A_TYPE tmp[32][33];
++
++void main() {
++    const uint tx = gl_LocalInvocationID.x;
++    const uint ty = gl_LocalInvocationID.y;
++
++    const uint row = gl_WorkGroupID.x * 32 + tx;
++
++    // src0 is already contiguous, copy it straight through.
++    if (gl_WorkGroupID.y == 0 && row < p.ne01) {
++        for (uint i0 = ty; i0 < p.ne00; i0 += 8) {
++            data_d[get_doffset() + row*p.nb21 + i0*p.nb20] = D_TYPE(data_a[get_aoffset() + row*p.nb01 + i0*p.nb00]);
++        }
++    }
++
++    [[unroll]] for (uint j = 0; j < 32; j += 8) {
++        const uint c = gl_WorkGroupID.y * 32 + ty + j;
++        if (c < p.ne10 && row < p.ne11) {
++            tmp[ty + j][tx] = A_TYPE(data_b[get_boffset() + c*p.nb10 + row*p.nb11]);
++        }
++    }
++
++    barrier();
++
++    const uint col = gl_WorkGroupID.y * 32 + tx;
++    [[unroll]] for (uint j = 0; j < 32; j += 8) {
++        const uint r = gl_WorkGroupID.x * 32 + ty + j;
++        if (col < p.ne10 && r < p.ne11) {
++            data_d[get_doffset() + r*p.nb21 + (p.ne00 + col)*p.nb20] = D_TYPE(tmp[tx][ty + j]);
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp
+index 6a6921474..75bdfe472 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp
+@@ -4,7 +4,7 @@
+ #include "generic_unary_head.glsl"
+ #include "dequant_funcs.glsl"
+ 
+-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
++#if defined(DATA_A_IQ4_NL) || defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4) || defined(DATA_A_ROCMFP_ANY)
+ // 16 invocations needed for init_iq_shmem
+ layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+ #else
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy_quant_same.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy_quant_same.comp
+new file mode 100644
+index 000000000..4b28c42a3
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/copy_quant_same.comp
+@@ -0,0 +1,55 @@
++#version 450
++
++#include "types.glsl"
++#include "generic_unary_head.glsl"
++
++layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
++
++#if !defined(BLOCK_BYTES)
++#error BLOCK_BYTES must be defined
++#endif
++
++uint src0_block_idx(uint idx) {
++    const uint ne00b = p.ne00 / QUANT_K;
++    const uint nb02 = p.ne01 * ne00b;
++    const uint nb03 = p.ne02 * nb02;
++
++    const uint i03 = idx / nb03;
++    const uint r03 = idx - i03 * nb03;
++    const uint i02 = r03 / nb02;
++    const uint r02 = r03 - i02 * nb02;
++    const uint i01 = r02 / ne00b;
++    const uint i00b = r02 - i01 * ne00b;
++
++    return i03*p.nb03 + i02*p.nb02 + i01*p.nb01 + i00b*p.nb00;
++}
++
++uint dst_block_idx(uint idx) {
++    const uint ne10b = p.ne10 / QUANT_K;
++    const uint nb12 = p.ne11 * ne10b;
++    const uint nb13 = p.ne12 * nb12;
++
++    const uint i13 = idx / nb13;
++    const uint r13 = idx - i13 * nb13;
++    const uint i12 = r13 / nb12;
++    const uint r12 = r13 - i12 * nb12;
++    const uint i11 = r12 / ne10b;
++    const uint i10b = r12 - i11 * ne10b;
++
++    return i13*p.nb13 + i12*p.nb12 + i11*p.nb11 + i10b*p.nb10;
++}
++
++void main() {
++    const uint idx = get_idx();
++
++    if (idx >= p.ne) {
++        return;
++    }
++
++    const uint src_base = get_aoffset() + src0_block_idx(idx) * BLOCK_BYTES;
++    const uint dst_base = get_doffset() + dst_block_idx(idx) * BLOCK_BYTES;
++
++    [[unroll]] for (uint j = 0; j < BLOCK_BYTES; ++j) {
++        data_d[dst_base + j] = data_a[src_base + j];
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
+index 776e9b8a5..481f9a8ca 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
+@@ -12,6 +12,10 @@ const uint BLOCK_SIZE = 32;
+ 
+ layout (binding = 0) readonly buffer S {S_TYPE data_s[];};
+ 
++float load_s(uint idx) {
++    return float(data_s[idx]);
++}
++
+ #if defined(SET_ROWS)
+ #include "generic_binary_head.glsl"
+ layout (binding = 1) readonly buffer C {B_TYPE data_i[];};
+@@ -286,6 +290,481 @@ void quantize(uint dst_idx, uint src_idx)
+ }
+ #endif
+ 
++#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
++float rocmfp4_code_value(uint q) {
++    switch (q & 0xFu) {
++        case  0u: return   0.0;
++        case  1u: return   1.0;
++        case  2u: return   2.0;
++        case  3u: return   3.0;
++        case  4u: return   4.0;
++        case  5u: return   6.0;
++        case  6u: return   8.0;
++        case  7u: return  10.0;
++        case  8u: return   0.0;
++        case  9u: return  -1.0;
++        case 10u: return  -2.0;
++        case 11u: return  -3.0;
++        case 12u: return  -4.0;
++        case 13u: return  -6.0;
++        case 14u: return  -8.0;
++        default:  return -10.0;
++    }
++}
++
++uint rocmfp4_best_index_scaled(float x, float inv_scale_half) {
++    const float a = abs(x * inv_scale_half);
++    if (a <= 0.5) {
++        return 0u;
++    }
++
++    const bool neg = x < 0.0;
++    if (a <= 1.5) return neg ?  9u : 1u;
++    if (a <= 2.5) return neg ? 10u : 2u;
++    if (a <= 3.5) return neg ? 11u : 3u;
++    if (a <= 5.0) return neg ? 12u : 4u;
++    if (a <= 7.0) return neg ? 13u : 5u;
++    if (a <= 9.0) return neg ? 14u : 6u;
++
++    return neg ? 15u : 7u;
++}
++
++float rocmfp4_block_mse_for_scale(uint src_idx, uint src_off, uint n, uint e, float best_err) {
++    const float scale_half = ue4m3_to_fp32(uint8_t(e));
++    const float inv_scale_half = scale_half > 0.0 ? 1.0 / scale_half : 0.0;
++    float err = 0.0;
++
++    for (uint j = 0; j < n; ++j) {
++        const float x = load_s(src_idx + src_off + j);
++        const uint q = rocmfp4_best_index_scaled(x, inv_scale_half);
++        const float y = rocmfp4_code_value(q) * scale_half;
++        const float d = x - y;
++        err += d * d;
++        if (err > best_err) {
++            return err;
++        }
++    }
++
++    return err;
++}
++
++uint rocmfp4_nearest_scale_ue4m3(float target_scale_half) {
++    if (target_scale_half <= 0.0) {
++        return 1u;
++    }
++
++    uint lo = 1u;
++    uint hi = 126u;
++    while (lo < hi) {
++        const uint mid = lo + (hi - lo) / 2u;
++        if (ue4m3_to_fp32(uint8_t(mid)) < target_scale_half) {
++            lo = mid + 1u;
++        } else {
++            hi = mid;
++        }
++    }
++
++    if (lo == 1u) {
++        return 1u;
++    }
++
++    const float hi_scale = ue4m3_to_fp32(uint8_t(lo));
++    const float lo_scale = ue4m3_to_fp32(uint8_t(lo - 1u));
++
++    // Match the previous ascending nearest scan: exact midpoint ties keep the
++    // lower scale byte.
++    return (target_scale_half - lo_scale <= hi_scale - target_scale_half) ? lo - 1u : lo;
++}
++
++uint rocmfp4_choose_scale_ue4m3(uint src_idx, uint src_off, uint n) {
++    float max_abs = 0.0;
++    for (uint j = 0; j < n; ++j) {
++        max_abs = max(max_abs, abs(load_s(src_idx + src_off + j)));
++    }
++    if (max_abs <= 0.0) {
++        return 0u;
++    }
++
++    const uint start_e = rocmfp4_nearest_scale_ue4m3(max_abs / 10.0);
++    uint best_e = 0u;
++    float best_err = 3.4028234663852886e38;
++    bool lower_done = false;
++
++    for (uint delta = 0u; delta <= 125u; ++delta) {
++        const int e0 = int(start_e) - int(delta);
++        if (!lower_done && e0 >= 1 && e0 <= 126) {
++            const float scale_half = ue4m3_to_fp32(uint8_t(e0));
++            const float clip_delta = max_abs - 10.0 * scale_half;
++            if (clip_delta > 0.0 && clip_delta * clip_delta > best_err) {
++                lower_done = true;
++            } else {
++                const uint e0u = uint(e0);
++                const float err = rocmfp4_block_mse_for_scale(src_idx, src_off, n, e0u, best_err);
++                if (err < best_err || (err == best_err && e0u < best_e)) {
++                    best_err = err;
++                    best_e = e0u;
++                }
++            }
++        }
++
++        const uint e1 = start_e + delta;
++        if (delta != 0u && e1 <= 126u) {
++            const float err = rocmfp4_block_mse_for_scale(src_idx, src_off, n, e1, best_err);
++            if (err < best_err || (err == best_err && e1 < best_e)) {
++                best_err = err;
++                best_e = e1;
++            }
++        }
++
++        if ((lower_done || e0 <= 1) && e1 >= 126u) {
++            break;
++        }
++    }
++
++    return best_e;
++}
++
++#endif
++
++#if defined(DATA_A_ROCMFP4)
++void quantize(uint dst_idx, uint src_idx)
++{
++    const uint e0 = rocmfp4_choose_scale_ue4m3(src_idx, 0u, QUANT_K_ROCMFP4 / 2);
++    const uint e1 = rocmfp4_choose_scale_ue4m3(src_idx, QUANT_K_ROCMFP4 / 2, QUANT_K_ROCMFP4 / 2);
++    const float d0 = ue4m3_to_fp32(uint8_t(e0));
++    const float d1 = ue4m3_to_fp32(uint8_t(e1));
++    const float id0 = d0 > 0.0 ? 1.0 / d0 : 0.0;
++    const float id1 = d1 > 0.0 ? 1.0 / d1 : 0.0;
++
++    data_q[dst_idx].e[0] = uint8_t(e0);
++    data_q[dst_idx].e[1] = uint8_t(e1);
++
++    [[unroll]] for (uint j = 0u; j < QUANT_K_ROCMFP4 / 2; ++j) {
++        const uint q0 = rocmfp4_best_index_scaled(load_s(src_idx + j), id0);
++        const uint q1 = rocmfp4_best_index_scaled(load_s(src_idx + QUANT_K_ROCMFP4 / 2 + j), id1);
++        data_q[dst_idx].qs[j] = uint8_t(q0 | (q1 << 4));
++    }
++}
++#endif
++
++#if defined(DATA_A_ROCMFP4_FAST)
++void quantize(uint dst_idx, uint src_idx)
++{
++    const uint e = rocmfp4_choose_scale_ue4m3(src_idx, 0u, QUANT_K_ROCMFP4);
++    const float d = ue4m3_to_fp32(uint8_t(e));
++    const float id = d > 0.0 ? 1.0 / d : 0.0;
++
++    data_q[dst_idx].e = uint8_t(e);
++
++    [[unroll]] for (uint j = 0u; j < QUANT_K_ROCMFP4 / 2; ++j) {
++        const uint q0 = rocmfp4_best_index_scaled(load_s(src_idx + j), id);
++        const uint q1 = rocmfp4_best_index_scaled(load_s(src_idx + QUANT_K_ROCMFP4 / 2 + j), id);
++        data_q[dst_idx].qs[j] = uint8_t(q0 | (q1 << 4));
++    }
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FAMILY)
++uint rocmfpx_nearest_scale_ue4m3(float target_scale) {
++    if (target_scale <= 0.0) {
++        return 0u;
++    }
++
++    uint lo = 1u;
++    uint hi = 126u;
++    while (lo < hi) {
++        const uint mid = lo + (hi - lo) / 2u;
++        if (ue4m3_to_fp32(uint8_t(mid)) < target_scale) {
++            lo = mid + 1u;
++        } else {
++            hi = mid;
++        }
++    }
++
++    if (lo == 1u) {
++        return 1u;
++    }
++
++    const float hi_scale = ue4m3_to_fp32(uint8_t(lo));
++    const float lo_scale = ue4m3_to_fp32(uint8_t(lo - 1u));
++    return (target_scale - lo_scale <= hi_scale - target_scale) ? lo - 1u : lo;
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP3)
++uint rocmfpx_fp3_quantize_code(float x, float inv_scale) {
++    if (inv_scale <= 0.0) {
++        return 0u;
++    }
++
++    const float ax = abs(x * inv_scale);
++    uint mag;
++    if (ax <= 0.5) {
++        mag = 0u;
++    } else if (ax <= 1.5) {
++        mag = 1u;
++    } else if (ax <= 3.0) {
++        mag = 2u;
++    } else {
++        mag = 3u;
++    }
++
++    return mag == 0u ? 0u : ((x < 0.0 ? 4u : 0u) | mag);
++}
++
++int rocmfpx_fp3_decode_value(uint code) {
++    const int mag = (code & 3u) == 3u ? 4 : int(code & 3u);
++    return (code & 4u) != 0u ? -mag : mag;
++}
++
++float rocmfpx_fp3_mse_for_scale(uint src_idx, uint offset, uint e, float best_err) {
++    const float scale = ue4m3_to_fp32(uint8_t(e));
++    const float inv_scale = scale > 0.0 ? 1.0 / scale : 0.0;
++    float err = 0.0;
++
++    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
++        const float x = load_s(src_idx + offset + j);
++        const uint code = rocmfpx_fp3_quantize_code(x, inv_scale);
++        const float y = float(rocmfpx_fp3_decode_value(code)) * scale;
++        const float d = x - y;
++
++        err += d*d;
++        if (err > best_err) {
++            return err;
++        }
++    }
++
++    return err;
++}
++
++uint rocmfpx_choose_scale_fp3_mse(uint src_idx, uint offset) {
++    float max_abs = 0.0;
++    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
++        max_abs = max(max_abs, abs(load_s(src_idx + offset + j)));
++    }
++
++    if (max_abs <= 0.0) {
++        return 0u;
++    }
++
++    const uint start_e = rocmfpx_nearest_scale_ue4m3(max_abs / 4.0);
++    uint best_e = start_e;
++    float best_err = 3.402823466e+38;
++    bool lower_done = false;
++
++    for (uint delta = 0u; delta <= 125u; ++delta) {
++        const int e0 = int(start_e) - int(delta);
++        if (!lower_done && e0 >= 1 && e0 <= 126) {
++            const float scale = ue4m3_to_fp32(uint8_t(uint(e0)));
++            const float clip_delta = max_abs - 4.0 * scale;
++            if (clip_delta > 0.0 && clip_delta*clip_delta > best_err) {
++                lower_done = true;
++            } else {
++                const float err = rocmfpx_fp3_mse_for_scale(src_idx, offset, uint(e0), best_err);
++                if (err < best_err || (err == best_err && uint(e0) < best_e)) {
++                    best_err = err;
++                    best_e = uint(e0);
++                }
++            }
++        }
++
++        const uint e1 = start_e + delta;
++        if (delta != 0u && e1 >= 1u && e1 <= 126u) {
++            const float err = rocmfpx_fp3_mse_for_scale(src_idx, offset, e1, best_err);
++            if (err < best_err || (err == best_err && e1 < best_e)) {
++                best_err = err;
++                best_e = e1;
++            }
++        }
++
++        if ((lower_done || e0 <= 1) && e1 >= 126u) {
++            break;
++        }
++    }
++
++    return best_e;
++}
++
++void rocmfpx_fp3_set_bits(inout uint qs[12], uint bit_pos, uint code) {
++    [[unroll]] for (uint bit = 0u; bit < 3u; ++bit) {
++        const uint dst_bit = bit_pos + bit;
++        const uint byte_index = dst_bit >> 3u;
++        const uint mask = 1u << (dst_bit & 7u);
++        uint v = qs[byte_index];
++        v = (code & (1u << bit)) != 0u ? (v | mask) : (v & ~mask);
++        qs[byte_index] = v;
++    }
++}
++
++void quantize(uint dst_idx, uint src_idx)
++{
++    uint qs[12];
++    [[unroll]] for (uint j = 0u; j < 12u; ++j) {
++        qs[j] = 0u;
++    }
++
++    [[unroll]] for (uint part = 0u; part < 2u; ++part) {
++        const uint offset = part * 16u;
++        const uint e = rocmfpx_choose_scale_fp3_mse(src_idx, offset);
++        const float d = ue4m3_to_fp32(uint8_t(e));
++        const float id = d > 0.0 ? 1.0 / d : 0.0;
++        data_q[dst_idx].e[part] = uint8_t(e);
++
++        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
++            const uint i = offset + j;
++            rocmfpx_fp3_set_bits(qs, i * 3u, rocmfpx_fp3_quantize_code(load_s(src_idx + i), id));
++        }
++    }
++
++    [[unroll]] for (uint j = 0u; j < 12u; ++j) {
++        data_q[dst_idx].qs[j] = uint8_t(qs[j]);
++    }
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP6)
++uint rocmfpx_fp6_quantize_code(float x, float inv_scale) {
++    if (inv_scale <= 0.0) {
++        return 0u;
++    }
++
++    // asymmetric signed range [-32, 31]; -32 is encoded as sign|0
++    const int q = clamp(int(round(x * inv_scale)), -32, 31);
++    if (q == 0) {
++        return 0u;
++    }
++    return q < 0 ? (32u | (uint(-q) & 31u)) : uint(q);
++}
++
++int rocmfpx_fp6_decode_value(uint code) {
++    const int mag = int(code & 31u);
++    return (code & 32u) != 0u ? -(mag == 0 ? 32 : mag) : mag;
++}
++
++float rocmfpx_fp6_mse_for_scale(uint src_idx, uint offset, uint e, float best_err) {
++    const float scale = ue4m3_to_fp32(uint8_t(e));
++    const float inv_scale = scale > 0.0 ? 1.0 / scale : 0.0;
++    float err = 0.0;
++
++    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
++        const float x = load_s(src_idx + offset + j);
++        const uint code = rocmfpx_fp6_quantize_code(x, inv_scale);
++        const float y = float(rocmfpx_fp6_decode_value(code)) * scale;
++        const float d = x - y;
++
++        err += d*d;
++        if (err > best_err) {
++            return err;
++        }
++    }
++
++    return err;
++}
++
++uint rocmfpx_choose_scale_fp6_mse(uint src_idx, uint offset) {
++    float max_abs = 0.0;
++    [[unroll]] for (uint j = 0u; j < 16u; ++j) {
++        max_abs = max(max_abs, abs(load_s(src_idx + offset + j)));
++    }
++
++    if (max_abs <= 0.0) {
++        return 0u;
++    }
++
++    const uint start_e = rocmfpx_nearest_scale_ue4m3(max_abs / 31.0);
++    uint best_e = start_e;
++    float best_err = 3.402823466e+38;
++    bool lower_done = false;
++
++    for (uint delta = 0u; delta <= 125u; ++delta) {
++        const int e0 = int(start_e) - int(delta);
++        if (!lower_done && e0 >= 1 && e0 <= 126) {
++            const float scale = ue4m3_to_fp32(uint8_t(uint(e0)));
++            const float clip_delta = max_abs - 31.0 * scale;
++            if (clip_delta > 0.0 && clip_delta*clip_delta > best_err) {
++                lower_done = true;
++            } else {
++                const float err = rocmfpx_fp6_mse_for_scale(src_idx, offset, uint(e0), best_err);
++                if (err < best_err || (err == best_err && uint(e0) < best_e)) {
++                    best_err = err;
++                    best_e = uint(e0);
++                }
++            }
++        }
++
++        const uint e1 = start_e + delta;
++        if (delta != 0u && e1 >= 1u && e1 <= 126u) {
++            const float err = rocmfpx_fp6_mse_for_scale(src_idx, offset, e1, best_err);
++            if (err < best_err || (err == best_err && e1 < best_e)) {
++                best_err = err;
++                best_e = e1;
++            }
++        }
++
++        if ((lower_done || e0 <= 1) && e1 >= 126u) {
++            break;
++        }
++    }
++
++    return best_e;
++}
++
++void quantize(uint dst_idx, uint src_idx)
++{
++    [[unroll]] for (uint part = 0u; part < 2u; ++part) {
++        const uint offset = part * 16u;
++        const uint e = rocmfpx_choose_scale_fp6_mse(src_idx, offset);
++        const float d = ue4m3_to_fp32(uint8_t(e));
++        const float id = d > 0.0 ? 1.0 / d : 0.0;
++        data_q[dst_idx].e[part] = uint8_t(e);
++
++        // pack four 6-bit codes into three bytes, little-endian
++        [[unroll]] for (uint g = 0u; g < 4u; ++g) {
++            const uint i0 = offset + g * 4u;
++            const uint c0 = rocmfpx_fp6_quantize_code(load_s(src_idx + i0 + 0u), id);
++            const uint c1 = rocmfpx_fp6_quantize_code(load_s(src_idx + i0 + 1u), id);
++            const uint c2 = rocmfpx_fp6_quantize_code(load_s(src_idx + i0 + 2u), id);
++            const uint c3 = rocmfpx_fp6_quantize_code(load_s(src_idx + i0 + 3u), id);
++
++            const uint b = (offset >> 4u) * 12u + g * 3u;
++            data_q[dst_idx].qs[b + 0u] = uint8_t(( c0        & 0x3Fu) | ((c1 & 0x03u) << 6));
++            data_q[dst_idx].qs[b + 1u] = uint8_t(((c1 >> 2u) & 0x0Fu) | ((c2 & 0x0Fu) << 4));
++            data_q[dst_idx].qs[b + 2u] = uint8_t(((c2 >> 4u) & 0x03u) | ((c3 & 0x3Fu) << 2));
++        }
++    }
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP8)
++
++int rocmfpx_fp8_quantize_code(float x, float inv_scale) {
++    if (inv_scale <= 0.0) {
++        return 0;
++    }
++
++    int q = int(round(x * inv_scale));
++    return clamp(q, -127, 127);
++}
++
++void quantize(uint dst_idx, uint src_idx)
++{
++    float max_abs = 0.0;
++    [[unroll]] for (uint j = 0u; j < QUANT_K_ROCMFPX_FP8; ++j) {
++        max_abs = max(max_abs, abs(load_s(src_idx + j)));
++    }
++
++    const uint e = rocmfpx_nearest_scale_ue4m3(max_abs / 127.0);
++    const float d = ue4m3_to_fp32(uint8_t(e));
++    const float id = d > 0.0 ? 1.0 / d : 0.0;
++
++    data_q[dst_idx].e = uint8_t(e);
++
++    [[unroll]] for (uint j = 0u; j < QUANT_K_ROCMFPX_FP8; ++j) {
++        data_q[dst_idx].qs[j] = int8_t(rocmfpx_fp8_quantize_code(load_s(src_idx + j), id));
++    }
++}
++#endif
++
+ #if defined(DATA_A_F32) || defined(DATA_A_F16)
+ void quantize(uint dst_idx, uint src_idx)
+ {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+index 627932bd3..a10636d5f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+@@ -510,6 +510,152 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+ }
+ #endif
+ 
++#if defined(DATA_A_ROCMFP4)
++vec2 dequantize(uint ib, uint iqs, uint a_offset) {
++    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
++    const float d0 = ue4m3_to_fp32(data_a[a_offset + ib].e[0]);
++    const float d1 = ue4m3_to_fp32(data_a[a_offset + ib].e[1]);
++    return vec2(float(kvalues_rocmfp4[vui & 0xF]) * d0,
++                float(kvalues_rocmfp4[vui >> 4]) * d1);
++}
++vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
++    const uint vui0 = uint(data_a[a_offset + ib].qs[iqs]);
++    const uint vui1 = uint(data_a[a_offset + ib].qs[iqs + 1]);
++    const float d0 = ue4m3_to_fp32(data_a[a_offset + ib].e[0]);
++    const float d1 = ue4m3_to_fp32(data_a[a_offset + ib].e[1]);
++    return vec4(float(kvalues_rocmfp4[vui0 & 0xF]) * d0,
++                float(kvalues_rocmfp4[vui0 >> 4]) * d1,
++                float(kvalues_rocmfp4[vui1 & 0xF]) * d0,
++                float(kvalues_rocmfp4[vui1 >> 4]) * d1);
++}
++#endif
++
++#if defined(DATA_A_ROCMFP4_FAST)
++vec2 dequantize(uint ib, uint iqs, uint a_offset) {
++    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
++    return vec2(float(kvalues_rocmfp4[vui & 0xF]) * d,
++                float(kvalues_rocmfp4[vui >> 4]) * d);
++}
++vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
++    const uint vui0 = uint(data_a[a_offset + ib].qs[iqs]);
++    const uint vui1 = uint(data_a[a_offset + ib].qs[iqs + 1]);
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
++    return vec4(float(kvalues_rocmfp4[vui0 & 0xF]) * d,
++                float(kvalues_rocmfp4[vui0 >> 4]) * d,
++                float(kvalues_rocmfp4[vui1 & 0xF]) * d,
++                float(kvalues_rocmfp4[vui1 >> 4]) * d);
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP3)
++uint rocmfpx_fp3_get_bits(uint ib, uint bit_pos, uint a_offset) {
++    uint code = 0u;
++    [[unroll]] for (uint bit = 0u; bit < 3u; ++bit) {
++        const uint src_bit = bit_pos + bit;
++        code |= ((uint(data_a[a_offset + ib].qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
++    }
++    return code;
++}
++
++int rocmfpx_fp3_decode_code(uint code) {
++    return int(kvalues_rocmfpx_fp3_const[code & 7u]);
++}
++
++float rocmfpx_fp3_dequant(uint ib, uint idx, uint a_offset) {
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e[idx >= 16u ? 1u : 0u]);
++    return float(rocmfpx_fp3_decode_code(rocmfpx_fp3_get_bits(ib, idx * 3u, a_offset))) * d;
++}
++
++// idx is a multiple of 4 at every call site, so bit_pos is a multiple of 12 and
++// the shift is 0 or 4: the twelve bits always fit in two bytes, no third byte
++// and no branch.
++int32_t rocmfpx_fp3_pack4_window(uint ib, uint idx, uint a_offset) {
++    const uint bit_pos = idx * 3u;
++    const uint byte_pos = bit_pos >> 3u;
++    const uint sh = bit_pos & 7u;
++    uint bits = uint(data_a[a_offset + ib].qs[byte_pos]) |
++                (uint(data_a[a_offset + ib].qs[byte_pos + 1u]) << 8);
++    bits = (bits >> sh) & 0xFFFu;
++    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
++}
++
++vec4 rocmfpx_fp3_dequant4(uint ib, uint idx, uint a_offset) {
++    const vec4 q = vec4(unpack8(rocmfpx_fp3_pack4_window(ib, idx, a_offset)));
++    // idx is a multiple of 4 and the halves split at element 16, so all four
++    // weights share one scale
++    return q * ue4m3_to_fp32(data_a[a_offset + ib].e[idx >= 16u ? 1u : 0u]);
++}
++
++vec2 dequantize(uint ib, uint iqs, uint a_offset) {
++    return vec2(rocmfpx_fp3_dequant(ib, iqs + 0u, a_offset),
++                rocmfpx_fp3_dequant(ib, iqs + 1u, a_offset));
++}
++
++vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
++    return rocmfpx_fp3_dequant4(ib, iqs, a_offset);
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP6)
++uint rocmfpx_fp6_get_bits(uint ib, uint idx, uint a_offset) {
++    const uint bit_pos  = idx * 6u;
++    const uint byte_pos = bit_pos >> 3u;
++    const uint sh       = bit_pos & 7u;
++    uint bits = uint(data_a[a_offset + ib].qs[byte_pos]);
++    if (sh > 2u) {
++        bits |= uint(data_a[a_offset + ib].qs[byte_pos + 1u]) << 8;
++    }
++    return (bits >> sh) & 0x3Fu;
++}
++
++float rocmfpx_fp6_dequant(uint ib, uint idx, uint a_offset) {
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e[idx >= 16u ? 1u : 0u]);
++    return float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, idx, a_offset))) * d;
++}
++
++vec2 dequantize(uint ib, uint iqs, uint a_offset) {
++    return vec2(rocmfpx_fp6_dequant(ib, iqs + 0u, a_offset),
++                rocmfpx_fp6_dequant(ib, iqs + 1u, a_offset));
++}
++
++// Every caller passes a multiple of 4, which makes this the fast case: four
++// 6-bit codes are exactly three whole bytes, so the gather needs no per-weight
++// bit window and no branch, and all four share one scale (the halves split at
++// element 16). rocmfpx_fp6_dequant() above stays for the unaligned callers.
++vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
++    const uint byte_pos = (iqs >> 2u) * 3u;
++    const uint bits = uint(data_a[a_offset + ib].qs[byte_pos     ])
++                    | uint(data_a[a_offset + ib].qs[byte_pos + 1u]) << 8
++                    | uint(data_a[a_offset + ib].qs[byte_pos + 2u]) << 16;
++
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e[iqs >= 16u ? 1u : 0u]);
++
++    return vec4(float(rocmfpx_fp6_decode_code( bits         & 0x3Fu)),
++                float(rocmfpx_fp6_decode_code((bits >>  6u) & 0x3Fu)),
++                float(rocmfpx_fp6_decode_code((bits >> 12u) & 0x3Fu)),
++                float(rocmfpx_fp6_decode_code((bits >> 18u) & 0x3Fu))) * d;
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP8)
++vec2 dequantize(uint ib, uint iqs, uint a_offset) {
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
++    return vec2(float(int(data_a[a_offset + ib].qs[iqs + 0u])) * d,
++                float(int(data_a[a_offset + ib].qs[iqs + 1u])) * d);
++}
++vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].e);
++    return vec4(float(int(data_a[a_offset + ib].qs[iqs + 0u])) * d,
++                float(int(data_a[a_offset + ib].qs[iqs + 1u])) * d,
++                float(int(data_a[a_offset + ib].qs[iqs + 2u])) * d,
++                float(int(data_a[a_offset + ib].qs[iqs + 3u])) * d);
++}
++#endif
++
+ #if defined(DATA_A_NVFP4)
+ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+     const uint sub = iqs >> 4;
+@@ -577,6 +723,13 @@ vec2 get_dm(uint ib, uint a_offset) {
+ }
+ #endif
+ 
++#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST) || defined(DATA_A_ROCMFPX_FAMILY)
++// the ROCm FP formats fold their UE4M3 scales into dequantize() directly
++vec2 get_dm(uint ib, uint a_offset) {
++    return vec2(1, 0);
++}
++#endif
++
+ #if defined(DATA_A_NVFP4)
+ vec2 get_dm(uint ib, uint a_offset) {
+     return vec2(1.0, 0.0);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs_cm2.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs_cm2.glsl
+index 46cc69cb2..0d729a25d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs_cm2.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs_cm2.glsl
+@@ -1333,6 +1333,157 @@ f16vec4 dequantFuncMXFP4_v(const in decodeBufMXFP4 bl, const in uint blockCoords
+ }
+ #endif
+ 
++#if defined(DATA_A_ROCMFP4)
++layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFP4 {
++   block_rocmfp4 block;
++};
++
++float16_t dequantFuncROCMFP4(const in decodeBufROCMFP4 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    const uint iqs = idx & 0xF;
++    const uint shift = (idx & 0x10) >> 2;
++    const uint sub = idx >> 4;
++    const float d = ue4m3_to_fp32(bl.block.e[sub]);
++    uint32_t qs = bl.block.qs[iqs];
++    qs >>= shift;
++    qs &= 0xF;
++    float16_t ret = float16_t(float(kvalues_rocmfp4[qs]) * d);
++    return ret;
++}
++#endif
++
++#if defined(DATA_A_ROCMFP4_FAST)
++layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFP4Fast {
++   block_rocmfp4_fast block;
++};
++
++float16_t dequantFuncROCMFP4Fast(const in decodeBufROCMFP4Fast bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    const uint iqs = idx & 0xF;
++    const uint shift = (idx & 0x10) >> 2;
++    const float d = ue4m3_to_fp32(bl.block.e);
++    uint32_t qs = bl.block.qs[iqs];
++    qs >>= shift;
++    qs &= 0xF;
++    float16_t ret = float16_t(float(kvalues_rocmfp4[qs]) * d);
++    return ret;
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP3)
++layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP3 {
++   block_rocmfpx_fp3 block;
++};
++
++uint rocmfpx_cm2_fp3_get_bits(const in decodeBufROCMFPXFP3 bl, uint bit_pos)
++{
++    uint code = 0u;
++    [[unroll]] for (uint bit = 0u; bit < 3u; ++bit) {
++        const uint src_bit = bit_pos + bit;
++        code |= ((uint(bl.block.qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
++    }
++    return code;
++}
++
++int rocmfpx_cm2_fp3_decode(uint code)
++{
++    return int(kvalues_rocmfpx_fp3_const[code & 7u]);
++}
++
++float16_t dequantFuncROCMFPXFP3(const in decodeBufROCMFPXFP3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    const float d = ue4m3_to_fp32(bl.block.e[idx >= 16u ? 1u : 0u]);
++    return float16_t(float(rocmfpx_cm2_fp3_decode(rocmfpx_cm2_fp3_get_bits(bl, idx * 3u))) * d);
++}
++
++int32_t rocmfpx_cm2_fp3_pack4_window(const in decodeBufROCMFPXFP3 bl, uint idx)
++{
++    const uint bit_pos = idx * 3u;
++    const uint byte_pos = bit_pos >> 3u;
++    const uint sh = bit_pos & 7u;
++    uint bits = uint(bl.block.qs[byte_pos]) |
++                (uint(bl.block.qs[byte_pos + 1u]) << 8);
++    if (sh > 4u) {
++        bits |= uint(bl.block.qs[byte_pos + 2u]) << 16;
++    }
++    bits = (bits >> sh) & 0xFFFu;
++    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
++}
++
++f16vec4 dequantFuncROCMFPXFP3_v(const in decodeBufROCMFPXFP3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    const vec4 q = vec4(unpack8(rocmfpx_cm2_fp3_pack4_window(bl, idx)));
++    return f16vec4(q * vec4(ue4m3_to_fp32(bl.block.e[(idx + 0u) >= 16u ? 1u : 0u]),
++                            ue4m3_to_fp32(bl.block.e[(idx + 1u) >= 16u ? 1u : 0u]),
++                            ue4m3_to_fp32(bl.block.e[(idx + 2u) >= 16u ? 1u : 0u]),
++                            ue4m3_to_fp32(bl.block.e[(idx + 3u) >= 16u ? 1u : 0u])));
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP6)
++layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP6 {
++   block_rocmfpx_fp6 block;
++};
++
++uint rocmfpx_cm2_fp6_get_bits(const in decodeBufROCMFPXFP6 bl, uint idx)
++{
++    const uint bit_pos  = idx * 6u;
++    const uint byte_pos = bit_pos >> 3u;
++    const uint sh       = bit_pos & 7u;
++    uint bits = uint(bl.block.qs[byte_pos]);
++    if (sh > 2u) {
++        bits |= uint(bl.block.qs[byte_pos + 1u]) << 8;
++    }
++    return (bits >> sh) & 0x3Fu;
++}
++
++float16_t dequantFuncROCMFPXFP6(const in decodeBufROCMFPXFP6 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    const float d = ue4m3_to_fp32(bl.block.e[idx >= 16u ? 1u : 0u]);
++    return float16_t(float(rocmfpx_fp6_decode_code(rocmfpx_cm2_fp6_get_bits(bl, idx))) * d);
++}
++
++f16vec4 dequantFuncROCMFPXFP6_v(const in decodeBufROCMFPXFP6 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    return f16vec4(float16_t(float(rocmfpx_fp6_decode_code(rocmfpx_cm2_fp6_get_bits(bl, idx + 0u))) * ue4m3_to_fp32(bl.block.e[(idx + 0u) >= 16u ? 1u : 0u])),
++                   float16_t(float(rocmfpx_fp6_decode_code(rocmfpx_cm2_fp6_get_bits(bl, idx + 1u))) * ue4m3_to_fp32(bl.block.e[(idx + 1u) >= 16u ? 1u : 0u])),
++                   float16_t(float(rocmfpx_fp6_decode_code(rocmfpx_cm2_fp6_get_bits(bl, idx + 2u))) * ue4m3_to_fp32(bl.block.e[(idx + 2u) >= 16u ? 1u : 0u])),
++                   float16_t(float(rocmfpx_fp6_decode_code(rocmfpx_cm2_fp6_get_bits(bl, idx + 3u))) * ue4m3_to_fp32(bl.block.e[(idx + 3u) >= 16u ? 1u : 0u])));
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP8)
++layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufROCMFPXFP8 {
++   block_rocmfpx_fp8 block;
++};
++
++float16_t dequantFuncROCMFPXFP8(const in decodeBufROCMFPXFP8 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    const float d = ue4m3_to_fp32(bl.block.e);
++    return float16_t(float(int(bl.block.qs[idx])) * d);
++}
++
++f16vec4 dequantFuncROCMFPXFP8_v(const in decodeBufROCMFPXFP8 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
++{
++    const uint idx = coordInBlock[1];
++    const float d = ue4m3_to_fp32(bl.block.e);
++    return f16vec4(vec4(float(int(bl.block.qs[idx + 0u])),
++                        float(int(bl.block.qs[idx + 1u])),
++                        float(int(bl.block.qs[idx + 2u])),
++                        float(int(bl.block.qs[idx + 3u]))) * d);
++}
++#endif
++
+ #if defined(DATA_A_NVFP4)
+ layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufNVFP4 {
+    block_nvfp4 block;
+@@ -1458,6 +1609,19 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
+ #elif defined(DATA_A_MXFP4)
+ #define dequantFuncA dequantFuncMXFP4
+ #define dequantFuncA_v dequantFuncMXFP4_v
++#elif defined(DATA_A_ROCMFP4)
++#define dequantFuncA dequantFuncROCMFP4
++#elif defined(DATA_A_ROCMFP4_FAST)
++#define dequantFuncA dequantFuncROCMFP4Fast
++#elif defined(DATA_A_ROCMFPX_FP3)
++#define dequantFuncA dequantFuncROCMFPXFP3
++#define dequantFuncA_v dequantFuncROCMFPXFP3_v
++#elif defined(DATA_A_ROCMFPX_FP6)
++#define dequantFuncA dequantFuncROCMFPXFP6
++#define dequantFuncA_v dequantFuncROCMFPXFP6_v
++#elif defined(DATA_A_ROCMFPX_FP8)
++#define dequantFuncA dequantFuncROCMFPXFP8
++#define dequantFuncA_v dequantFuncROCMFPXFP8_v
+ #elif defined(DATA_A_NVFP4)
+ #define dequantFuncA dequantFuncNVFP4
+ #define dequantFuncA_v dequantFuncNVFP4_v
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfp4.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfp4.comp
+new file mode 100644
+index 000000000..46cc1bd7d
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfp4.comp
+@@ -0,0 +1,33 @@
++#version 450
++
++#include "dequant_head.glsl"
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {block_rocmfp4 data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
++
++void main() {
++    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
++
++    init_iq_shmem(gl_WorkGroupSize);
++
++    const uint tid = gl_LocalInvocationID.x % 64;
++    const uint il  = tid/32;
++    const uint ir  = tid%32;
++    const uint ib = 32*i + ir;
++    if (ib >= p.nel / 32) {
++        return;
++    }
++
++    const uint q_idx = 8*il;
++    const uint b_idx = 1024*i + 32*ir + q_idx;
++
++    const float d0 = ue4m3_to_fp32(data_a[ib].e[0]);
++    const float d1 = ue4m3_to_fp32(data_a[ib].e[1]);
++
++    [[unroll]] for (uint l = 0; l < 8; ++l) {
++        data_b[b_idx + l +  0] = D_TYPE(d0 * float(kvalues_rocmfp4[data_a[ib].qs[q_idx + l] & 0xF]));
++        data_b[b_idx + l + 16] = D_TYPE(d1 * float(kvalues_rocmfp4[data_a[ib].qs[q_idx + l] >>  4]));
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfp4_fast.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfp4_fast.comp
+new file mode 100644
+index 000000000..360ff679f
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfp4_fast.comp
+@@ -0,0 +1,31 @@
++#version 450
++
++#include "dequant_head.glsl"
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {block_rocmfp4_fast data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
++
++void main() {
++    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
++
++    init_iq_shmem(gl_WorkGroupSize);
++
++    const uint tid = gl_LocalInvocationID.x % 64;
++    const uint il  = tid/32;
++    const uint ir  = tid%32;
++    const uint ib = 32*i + ir;
++    if (ib >= p.nel / 32) {
++        return;
++    }
++
++    const uint q_idx = 8*il;
++    const uint b_idx = 1024*i + 32*ir + q_idx;
++    const float d = ue4m3_to_fp32(data_a[ib].e);
++
++    [[unroll]] for (uint l = 0; l < 8; ++l) {
++        data_b[b_idx + l +  0] = D_TYPE(d * float(kvalues_rocmfp4[data_a[ib].qs[q_idx + l] & 0xF]));
++        data_b[b_idx + l + 16] = D_TYPE(d * float(kvalues_rocmfp4[data_a[ib].qs[q_idx + l] >>  4]));
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp3.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp3.comp
+new file mode 100644
+index 000000000..e3aab966d
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp3.comp
+@@ -0,0 +1,46 @@
++#version 450
++
++#include "dequant_head.glsl"
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {block_rocmfpx_fp3 data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
++
++uint rocmfpx_fp3_get_bits(uint ib, uint bit_pos) {
++    uint code = 0u;
++    [[unroll]] for (uint bit = 0u; bit < 3u; ++bit) {
++        const uint src_bit = bit_pos + bit;
++        code |= ((uint(data_a[ib].qs[src_bit >> 3u]) >> (src_bit & 7u)) & 1u) << bit;
++    }
++    return code;
++}
++
++int rocmfpx_fp3_decode_code(uint code) {
++    const uint mag_code = code & 3u;
++    const int mag = mag_code == 3u ? 4 : int(mag_code);
++    return (code & 4u) != 0u ? -mag : mag;
++}
++
++void main() {
++    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
++
++    init_iq_shmem(gl_WorkGroupSize);
++
++    const uint tid = gl_LocalInvocationID.x % 64;
++    const uint il  = tid/32;
++    const uint ir  = tid%32;
++    const uint ib = 32*i + ir;
++    if (ib >= p.nel / 32) {
++        return;
++    }
++
++    const uint b_idx = 1024*i + 32*ir + 16*il;
++    const uint q_idx = 16*il;
++    const float d = ue4m3_to_fp32(data_a[ib].e[il]);
++
++    [[unroll]] for (uint l = 0; l < 16; ++l) {
++        const uint idx = q_idx + l;
++        data_b[b_idx + l] = D_TYPE(d * float(rocmfpx_fp3_decode_code(rocmfpx_fp3_get_bits(ib, idx * 3u))));
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp6.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp6.comp
+new file mode 100644
+index 000000000..5da0e9e8c
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp6.comp
+@@ -0,0 +1,44 @@
++#version 450
++
++#include "dequant_head.glsl"
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {block_rocmfpx_fp6 data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
++
++uint rocmfpx_fp6_get_bits(uint ib, uint idx) {
++    const uint bit_pos  = idx * 6u;
++    const uint byte_pos = bit_pos >> 3u;
++    const uint sh       = bit_pos & 7u;
++    uint bits = uint(data_a[ib].qs[byte_pos]);
++    if (sh > 2u) {
++        bits |= uint(data_a[ib].qs[byte_pos + 1u]) << 8;
++    }
++    return (bits >> sh) & 0x3Fu;
++}
++
++void main() {
++    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
++
++#ifdef NEEDS_INIT_IQ_SHMEM
++    init_iq_shmem(gl_WorkGroupSize);
++#endif
++
++    const uint tid = gl_LocalInvocationID.x % 64;
++    const uint il  = tid/32;
++    const uint ir  = tid%32;
++    const uint ib = 32*i + ir;
++    if (ib >= p.nel / 32) {
++        return;
++    }
++
++    const uint b_idx = 1024*i + 32*ir + 16*il;
++    const uint q_idx = 16*il;
++    const float d = ue4m3_to_fp32(data_a[ib].e[il]);
++
++    [[unroll]] for (uint l = 0; l < 16; ++l) {
++        const uint idx = q_idx + l;
++        data_b[b_idx + l] = D_TYPE(d * float(rocmfpx_fp6_decode_code(rocmfpx_fp6_get_bits(ib, idx))));
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp8.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp8.comp
+new file mode 100644
+index 000000000..7052de542
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_rocmfpx_fp8.comp
+@@ -0,0 +1,31 @@
++#version 450
++
++#include "dequant_head.glsl"
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {block_rocmfpx_fp8 data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
++
++void main() {
++    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
++
++    init_iq_shmem(gl_WorkGroupSize);
++
++    const uint tid = gl_LocalInvocationID.x % 64;
++    const uint il  = tid/32;
++    const uint ir  = tid%32;
++    const uint ib = 32*i + ir;
++    if (ib >= p.nel / 32) {
++        return;
++    }
++
++    const uint b_idx = 1024*i + 32*ir + 16*il;
++    const uint q_idx = 16*il;
++    const float d = ue4m3_to_fp32(data_a[ib].e);
++
++    [[unroll]] for (uint l = 0; l < 16; l += 2) {
++        data_b[b_idx + l    ] = D_TYPE(d * float(data_a[ib].qs[q_idx + l    ]));
++        data_b[b_idx + l + 1] = D_TYPE(d * float(data_a[ib].qs[q_idx + l + 1]));
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
+index 5cdf2a89d..42f52b4a1 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
+@@ -7,7 +7,14 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+ 
+-void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
++// invocations per superblock. with many columns, 8 invocations need too many
++// registers and spill, so use 16 to halve the per-invocation B working set
++const uint TPB = NUM_COLS <= 4 ? 8 : 16;
++const uint NL  = 32 / TPB; // l steps per invocation
++
++void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
++    const uint ib32 = itid / (TPB / 8);
++    const uint l0   = (itid % (TPB / 8)) * NL;
+     const uint y_idx = i * QUANT_K + 32 * ib32;
+ 
+     uint ibi = a_offset + first_row * num_blocks_per_row + i;
+@@ -16,11 +23,8 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+         const uint scale = (data_a[ibi].scales[ib32/2] >> (4 * (ib32 & 1))) & 0xF;
+         const float dscale = d * (1 + 2 * scale);
+         const uint qh = data_a[ibi].qh[ib32];
+-        FLOAT_TYPE sum[NUM_COLS];
+-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            sum[j] = 0.0;
+-        }
+-        [[unroll]] for (uint l = 0; l < 4; ++l) {
++        [[unroll]] for (uint ll = 0; ll < NL; ++ll) {
++            const uint l = l0 + ll;
+             const u8vec2 qs = unpack8(uint32_t(data_a_packed16[ibi].qs[4 * ib32 + l])).xy; // vec4 used due to #12147
+             const uint sign = data_a[ibi].signs[4 * ib32 + l];
+             const vec4 grid0 = vec4(unpack8(iq3s_grid[qs.x | ((qh << (8 - 2*l)) & 0x100)]));
+@@ -30,7 +34,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+                 const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
+                 const vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+ 
+-                sum[j] =
++                const FLOAT_TYPE sum =
+                       fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
+                       fma(FLOAT_TYPE(b0.y), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y),
+                       fma(FLOAT_TYPE(b0.z), FLOAT_TYPE((sign &   4) != 0 ? -grid0.z : grid0.z),
+@@ -39,12 +43,11 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+                       fma(FLOAT_TYPE(b4.y), FLOAT_TYPE((sign &  32) != 0 ? -grid1.y : grid1.y),
+                       fma(FLOAT_TYPE(b4.z), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z),
+                       fma(FLOAT_TYPE(b4.w), FLOAT_TYPE((sign & 128) != 0 ? -grid1.w : grid1.w),
+-                      sum[j]))))))));
++                      FLOAT_TYPE(0.0)))))))));
++
++                temp[j][n] = fma(dscale, sum, temp[j][n]);
+             }
+         }
+-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+-            temp[j][n] = fma(dscale, sum[j], temp[j][n]);
+-        }
+         ibi += num_blocks_per_row;
+     }
+ }
+@@ -55,11 +58,11 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+ 
+     const uint num_blocks_per_row = p.ncols / QUANT_K;
+ 
+-    // 8 threads are used to process each block
+-    const uint blocks_per_wg = gl_WorkGroupSize.x/8;
++    // TPB invocations are used to process each block
++    const uint blocks_per_wg = gl_WorkGroupSize.x/TPB;
+     const uint tid = gl_LocalInvocationID.x;
+-    const uint itid = tid % 8;  // 0...7
+-    const uint ix = tid / 8;
++    const uint itid = tid % TPB;
++    const uint ix = tid / TPB;
+ 
+     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index 18d441ead..0ebdde36c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -13,7 +13,12 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ #if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
+ #define K_PER_ITER 16
+-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
++#elif defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
++// A whole block per call. The ROCmFP4 scales are UE4M3 and cost a byte load plus
++// a table lookup each, so decoding them once per 32 weights instead of once per
++// 8 is worth the extra B registers.
++#define K_PER_ITER 32
++#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4) || defined(DATA_A_ROCMFPX_FP8)
+ #define K_PER_ITER 8
+ #elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M)
+ #define K_PER_ITER 32
+@@ -37,9 +42,16 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+         cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+ 
+ #if QUANT_R == 2
+-        // Assumes K_PER_ITER == 8
++#if K_PER_ITER == 8
+         cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
+         cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
++#elif K_PER_ITER == 32
++        [[unroll]] for (uint k = 0; k < 8; ++k) {
++            cache_b_qs[k] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + k];
++        }
++#else
++#error unimplemented
++#endif
+ #else
+ #if K_PER_ITER == 8
+         cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2];
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+index a5403ac82..bded20680 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+@@ -137,6 +137,70 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
+ }
+ #endif
+ 
++#if defined(DATA_A_ROCMFP4)
++// dual UE4M3 scales: e[0] covers elements 0-15, e[1] covers 16-31
++FLOAT_TYPEV2 get_dm2(uint ib) {
++    return FLOAT_TYPEV2(ue4m3_to_fp32(data_a[ib].e[0]), ue4m3_to_fp32(data_a[ib].e[1]));
++}
++#endif
++
++#if defined(DATA_A_ROCMFP4_FAST)
++FLOAT_TYPEV2 get_dm2(uint ib) {
++    const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib].e));
++    return FLOAT_TYPEV2(d, d);
++}
++#endif
++
++#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
++// 1-byte quant loads for ROCmFP4 blocks (18 / 17 bytes). Low nibbles are the
++// first half of the block, high nibbles the second half.
++i32vec2 repack(uint ib, uint iqs) {
++    const uint32_t qs = pack32(u8vec4(data_a[ib].qs[iqs * 4    ],
++                                      data_a[ib].qs[iqs * 4 + 1],
++                                      data_a[ib].qs[iqs * 4 + 2],
++                                      data_a[ib].qs[iqs * 4 + 3]));
++
++    const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
++    const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
++
++    return i32vec2(pack32(i8vec4(kvalues_rocmfp4[i_a0.x], kvalues_rocmfp4[i_a0.y], kvalues_rocmfp4[i_a0.z], kvalues_rocmfp4[i_a0.w])),
++                   pack32(i8vec4(kvalues_rocmfp4[i_a1.x], kvalues_rocmfp4[i_a1.y], kvalues_rocmfp4[i_a1.z], kvalues_rocmfp4[i_a1.w])));
++}
++
++// K_PER_ITER is 32 for these types: one call consumes a whole block, so the
++// UE4M3 scales are decoded once per block rather than once per 8 weights.
++FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
++    // the two halves carry different scales, so they cannot share an accumulator
++    int32_t q_sum0 = 0;
++    int32_t q_sum1 = 0;
++
++    [[unroll]] for (uint k = 0; k < 4; ++k) {
++        const i32vec2 data_a_qs = repack(ib_a, k);
++        q_sum0 += dotPacked4x8EXT(data_a_qs.x, cache_b_qs[k]);
++        q_sum1 += dotPacked4x8EXT(data_a_qs.y, cache_b_qs[k + 4]);
++    }
++
++    const FLOAT_TYPEV2 d = get_dm2(ib_a);
++    return FLOAT_TYPE(cache_b_ds.x * (float(q_sum0) * float(d.x) + float(q_sum1) * float(d.y)));
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP8)
++// int8 values with one UE4M3 scale per 32-element block
++FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
++    const int32_t qs0 = pack32(i8vec4(data_a[ib_a].qs[iqs * 8    ], data_a[ib_a].qs[iqs * 8 + 1],
++                                      data_a[ib_a].qs[iqs * 8 + 2], data_a[ib_a].qs[iqs * 8 + 3]));
++    const int32_t qs1 = pack32(i8vec4(data_a[ib_a].qs[iqs * 8 + 4], data_a[ib_a].qs[iqs * 8 + 5],
++                                      data_a[ib_a].qs[iqs * 8 + 6], data_a[ib_a].qs[iqs * 8 + 7]));
++
++    const int32_t q_sum = dotPacked4x8EXT(qs0, cache_b_qs[0]) +
++                          dotPacked4x8EXT(qs1, cache_b_qs[1]);
++
++    const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e));
++    return FLOAT_TYPE(cache_b_ds.x * float(d) * float(q_sum));
++}
++#endif
++
+ #if defined(DATA_A_MXFP4)
+ // 1-byte loads for mxfp4 blocks (17 bytes)
+ i32vec2 repack(uint ib, uint iqs) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
+index 7d852dced..9ea477e89 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_funcs.glsl
+@@ -17,6 +17,54 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
+     buf_a[a_shmem_index(m, k_pair)] = value;
+ }
+ 
++#if defined(DATA_A_ROCMFPX_FP3)
++int32_t rocmfpx_mm_fp3_pack4_window(uint ib, uint idx) {
++    const uint bit_pos = idx * 3u;
++    const uint byte_pos = bit_pos >> 3u;
++    const uint sh = bit_pos & 7u;
++    uint bits = uint(data_a[ib].qs[byte_pos]) |
++                (uint(data_a[ib].qs[byte_pos + 1u]) << 8);
++    if (sh > 4u) {
++        bits |= uint(data_a[ib].qs[byte_pos + 2u]) << 16;
++    }
++    bits = (bits >> sh) & 0xFFFu;
++    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
++                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
++}
++
++vec4 rocmfpx_mm_fp3_vec4(uint ib, uint idx) {
++    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
++    return vec4(unpack8(rocmfpx_mm_fp3_pack4_window(ib, idx))) * d;
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP6)
++uint rocmfpx_mm_fp6_get_bits(uint ib, uint idx) {
++    const uint bit_pos  = idx * 6u;
++    const uint byte_pos = bit_pos >> 3u;
++    const uint sh       = bit_pos & 7u;
++    uint bits = uint(data_a[ib].qs[byte_pos]);
++    if (sh > 2u) {
++        bits |= uint(data_a[ib].qs[byte_pos + 1u]) << 8;
++    }
++    return (bits >> sh) & 0x3Fu;
++}
++
++float rocmfpx_mm_fp6_value(uint ib, uint idx) {
++    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
++    return float(rocmfpx_fp6_decode_code(rocmfpx_mm_fp6_get_bits(ib, idx))) * d;
++}
++
++vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
++    return vec4(rocmfpx_mm_fp6_value(ib, idx + 0u),
++                rocmfpx_mm_fp6_value(ib, idx + 1u),
++                rocmfpx_mm_fp6_value(ib, idx + 2u),
++                rocmfpx_mm_fp6_value(ib, idx + 3u));
++}
++#endif
++
+ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
+ #if defined(DATA_A_F32) || defined(DATA_A_F16)
+ #if LOAD_VEC_A == 8
+@@ -557,6 +605,63 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
+             store_a(col, row + 8, FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
+                                               kvalues_mxfp4[vui2 >>  4] * d));
+ #endif
++#elif defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
++            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
++
++            const uint ib = idx / 8;
++            const uint iqs = (idx & 0x07) * 2;
++
++            const uint vui  = uint(data_a[ib].qs[iqs]);
++            const uint vui2 = uint(data_a[ib].qs[iqs+1]);
++
++            // low nibbles hold the first half of the block (scale e[0]),
++            // high nibbles the second half (scale e[1])
++#if defined(DATA_A_ROCMFP4)
++            const float d0 = ue4m3_to_fp32(data_a[ib].e[0]);
++            const float d1 = ue4m3_to_fp32(data_a[ib].e[1]);
++#else
++            const float d0 = ue4m3_to_fp32(data_a[ib].e);
++            const float d1 = d0;
++#endif
++            store_a(col, row,     FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  & 0xF]) * d0,
++                                               float(kvalues_rocmfp4[vui2 & 0xF]) * d0));
++            store_a(col, row + 8, FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  >>  4]) * d1,
++                                               float(kvalues_rocmfp4[vui2 >>  4]) * d1));
++#elif defined(DATA_A_ROCMFPX_FP3)
++            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
++
++            const uint ib = idx / 8;
++            const uint iqs = (idx & 0x07) * 4;
++            const vec4 v = rocmfpx_mm_fp3_vec4(ib, iqs);
++
++            const uint k_pair = row * LOAD_VEC_A / 2;
++            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
++            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
++#elif defined(DATA_A_ROCMFPX_FP6)
++            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
++
++            const uint ib = idx / 8;
++            const uint iqs = (idx & 0x07) * 4;
++            const vec4 v = rocmfpx_mm_fp6_vec4(ib, iqs);
++
++            const uint k_pair = row * LOAD_VEC_A / 2;
++            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
++            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
++#elif defined(DATA_A_ROCMFPX_FP8)
++            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
++
++            const uint ib = idx / 8;
++            const uint iqs = (idx & 0x07) * 4;
++
++            const float d = ue4m3_to_fp32(data_a[ib].e);
++            const vec4 v = vec4(float(data_a[ib].qs[iqs + 0u]),
++                                float(data_a[ib].qs[iqs + 1u]),
++                                float(data_a[ib].qs[iqs + 2u]),
++                                float(data_a[ib].qs[iqs + 3u])) * d;
++
++            const uint k_pair = row * LOAD_VEC_A / 2;
++            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
++            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+ #elif defined(DATA_A_NVFP4)
+             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+             const uint ib = idx / 16u;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
+index 24da4f715..478a65843 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_funcs.glsl
+@@ -178,6 +178,62 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
+ }
+ #endif
+ 
++#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
++// 1-byte loads for ROCmFP4 blocks (18 / 17 bytes). Low nibbles are the first
++// half of the block, high nibbles the second half.
++void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
++    const uint32_t qs = pack32(u8vec4(data_a[ib].qs[iqs * 4    ],
++                                      data_a[ib].qs[iqs * 4 + 1],
++                                      data_a[ib].qs[iqs * 4 + 2],
++                                      data_a[ib].qs[iqs * 4 + 3]));
++
++    const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
++    const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
++
++    buf_a[buf_ib].qs[iqs    ] = pack32(i8vec4(kvalues_rocmfp4[i_a0.x], kvalues_rocmfp4[i_a0.y], kvalues_rocmfp4[i_a0.z], kvalues_rocmfp4[i_a0.w]));
++    buf_a[buf_ib].qs[iqs + 4] = pack32(i8vec4(kvalues_rocmfp4[i_a1.x], kvalues_rocmfp4[i_a1.y], kvalues_rocmfp4[i_a1.z], kvalues_rocmfp4[i_a1.w]));
++
++    if (iqs == 0) {
++#if defined(DATA_A_ROCMFP4)
++        buf_a[buf_ib].d = FLOAT_TYPEV2(ue4m3_to_fp32(data_a[ib].e[0]),
++                                       ue4m3_to_fp32(data_a[ib].e[1]));
++#else
++        buf_a[buf_ib].d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib].e));
++#endif
++    }
++}
++
++void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
++    cache_a[reg_ib].d = buf_a[buf_ib].d;
++
++    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
++        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
++    }
++}
++
++ACC_TYPE mmq_dot_product(const uint ib_a) {
++#if defined(DATA_A_ROCMFP4)
++    // the halves carry different scales, so they need separate accumulators
++    int32_t q_sum0 = 0;
++    int32_t q_sum1 = 0;
++    [[unroll]] for (uint iqs = 0; iqs < 4; iqs++) {
++        q_sum0 += dotPacked4x8EXT(cache_a[ib_a].qs[iqs],     cache_b.qs[iqs]);
++        q_sum1 += dotPacked4x8EXT(cache_a[ib_a].qs[iqs + 4], cache_b.qs[iqs + 4]);
++    }
++
++    return ACC_TYPE((float(q_sum0) * float(cache_a[ib_a].d.x) +
++                     float(q_sum1) * float(cache_a[ib_a].d.y)) * float(cache_b.ds.x));
++#else
++    int32_t q_sum = 0;
++    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
++        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
++    }
++
++    return ACC_TYPE(float(q_sum) * float(cache_a[ib_a].d) * float(cache_b.ds.x));
++#endif
++}
++#endif
++
+ #if defined(DATA_A_MXFP4)
+ // 1-byte loads for mxfp4 blocks (17 bytes)
+ void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
+index 2b7adcb6c..1995acaf3 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq_shmem_types.glsl
+@@ -59,6 +59,18 @@ struct block_a_cache {
+     int32_t qs[8];
+     FLOAT_TYPE d;
+ };
++#elif defined(DATA_A_ROCMFP4)
++#define QUANT_R_MMQ 2
++struct block_a_cache {
++    int32_t qs[8];
++    FLOAT_TYPEV2 d;   // one UE4M3 scale per half block
++};
++#elif defined(DATA_A_ROCMFP4_FAST)
++#define QUANT_R_MMQ 2
++struct block_a_cache {
++    int32_t qs[8];
++    FLOAT_TYPE d;
++};
+ #elif defined(DATA_A_Q2_K)
+ #define QUANT_R_MMQ 4
+ struct block_a_cache {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index adb1bb8b3..983b07320 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -1804,6 +1804,87 @@ struct block_nvfp4_packed32
+ #define A_TYPE_PACKED32 block_nvfp4_packed32
+ #endif
+ 
++#define QUANT_K_ROCMFP4 32
++#define QUANT_R_ROCMFP4 2
++
++struct block_rocmfp4
++{
++    uint8_t qs[QUANT_K_ROCMFP4/2];
++    uint8_t e[2];
++};
++
++struct block_rocmfp4_fast
++{
++    uint8_t qs[QUANT_K_ROCMFP4/2];
++    uint8_t e;
++};
++
++#if defined(DATA_A_ROCMFP4)
++#define QUANT_K QUANT_K_ROCMFP4
++#define QUANT_R QUANT_R_ROCMFP4
++#define QUANT_AUXF 1
++#define A_TYPE block_rocmfp4
++#endif
++
++#if defined(DATA_A_ROCMFP4_FAST)
++#define QUANT_K QUANT_K_ROCMFP4
++#define QUANT_R QUANT_R_ROCMFP4
++#define QUANT_AUXF 1
++#define A_TYPE block_rocmfp4_fast
++#endif
++
++#define QUANT_K_ROCMFPX_FP8 32
++#define QUANT_R_ROCMFPX_FP8 1
++
++struct block_rocmfpx_fp3
++{
++    uint8_t qs[12];
++    uint8_t e[2];
++};
++
++// 32 codes of 6 bits, little-endian packed into 24 bytes, plus two UE4M3
++// half-block scales. Matches block_rocmfp6 in ggml/rocmfpx/rocmfpx.h.
++struct block_rocmfpx_fp6
++{
++    uint8_t qs[24];
++    uint8_t e[2];
++};
++
++struct block_rocmfpx_fp8
++{
++    int8_t qs[QUANT_K_ROCMFPX_FP8];
++    uint8_t e;
++};
++
++#if defined(DATA_A_ROCMFPX_FP3)
++#define QUANT_K QUANT_K_ROCMFPX_FP8
++#define QUANT_R QUANT_R_ROCMFPX_FP8
++#define QUANT_AUXF 1
++#define A_TYPE block_rocmfpx_fp3
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP6)
++#define QUANT_K QUANT_K_ROCMFPX_FP8
++#define QUANT_R QUANT_R_ROCMFPX_FP8
++#define QUANT_AUXF 1
++#define A_TYPE block_rocmfpx_fp6
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP8)
++#define QUANT_K QUANT_K_ROCMFPX_FP8
++#define QUANT_R QUANT_R_ROCMFPX_FP8
++#define QUANT_AUXF 1
++#define A_TYPE block_rocmfpx_fp8
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP3) || defined(DATA_A_ROCMFPX_FP6) || defined(DATA_A_ROCMFPX_FP8)
++#define DATA_A_ROCMFPX_FAMILY
++#endif
++
++#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST) || defined(DATA_A_ROCMFPX_FAMILY)
++#define DATA_A_ROCMFP_ANY
++#endif
++
+ #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+ const int8_t kvalues_iq4nl_const[16] = {
+     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
+@@ -1823,6 +1904,71 @@ void init_iq_shmem(uvec3 wgsize)
+ }
+ #endif
+ 
++#if defined(DATA_A_ROCMFP_ANY) || defined(FA_ROCMFPX_FAMILY)
++// The ROCm FP formats share one UE4M3 scale encoding. It differs from the
++// NVFP4 encoding: the exponent bias is one lower and subnormals are scaled by
++// 1/1024, which keeps the halved ROCmFP4 codebook multiply-free at call sites.
++shared float rocmfp_ue4m3_fp32_lut[128];
++
++float rocmfp_ue4m3_to_fp32_build(uint u) {
++    if (u == 0u || u == 127u) {
++        return 0.0;
++    }
++    const uint exp = (u >> 3) & 15u;
++    const uint man = u & 7u;
++    if (exp == 0u) {
++        return float(man) * (1.0 / 1024.0);
++    }
++    const uint bits = (exp + 119u) << 23 | (man << 20);
++    return uintBitsToFloat(bits);
++}
++
++float ue4m3_to_fp32(uint8_t x) {
++    return rocmfp_ue4m3_fp32_lut[min(uint(x), 127u)];
++}
++#endif
++
++#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
++// E2M1-derived codebook with the top level retuned from 12 to 10.
++const int8_t kvalues_rocmfp4_const[16] = {
++    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(10),
++    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-10),
++};
++
++shared int8_t kvalues_rocmfp4[16];
++#endif
++
++#if defined(DATA_A_ROCMFPX_FP6)
++int rocmfpx_fp6_decode_code(uint code) {
++    const int mag = int(code & 31u);
++    return (code & 32u) != 0u ? -(mag == 0 ? 32 : mag) : mag;
++}
++#endif
++
++#if defined(DATA_A_ROCMFPX_FAMILY)
++const int8_t kvalues_rocmfpx_fp3_const[8] = {
++    int8_t(0), int8_t(1), int8_t(2), int8_t(4),
++    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-4)
++};
++#endif
++
++#if defined(DATA_A_ROCMFP_ANY)
++#define NEEDS_INIT_IQ_SHMEM
++void init_iq_shmem(uvec3 wgsize)
++{
++    // copy the tables into shared memory and sync
++#if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
++    for (uint i = gl_LocalInvocationIndex.x; i < kvalues_rocmfp4.length(); i += wgsize.x) {
++        kvalues_rocmfp4[i] = kvalues_rocmfp4_const[i];
++    }
++#endif
++    for (uint i = gl_LocalInvocationIndex.x; i < rocmfp_ue4m3_fp32_lut.length(); i += wgsize.x) {
++        rocmfp_ue4m3_fp32_lut[i] = rocmfp_ue4m3_to_fp32_build(i);
++    }
++    barrier();
++}
++#endif
++
+ #if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
+ #if !defined(USE_OCP_FP4)
+ const int8_t kvalues_mxfp4_const[16] = {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 17d57d5a1..c939c1a91 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -71,6 +71,11 @@ const std::vector<std::string> type_names = {
+     "iq4_xs",
+     "iq4_nl",
+     "mxfp4",
++    "rocmfp4",
++    "rocmfp4_fast",
++    "rocmfpx_fp3",
++    "rocmfpx_fp6",
++    "rocmfpx_fp8",
+     "nvfp4",
+     "tq2_0",
+     "bf16",
+@@ -585,7 +590,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+         std::string load_vec_quant = "2";
+         if ((tname == "q1_0") || (tname == "q4_0") || (tname == "q4_1") || (tname == "q5_1") || (tname == "iq1_s") || (tname == "iq1_m") || (tname == "iq2_xxs") || (tname == "iq2_xs") || (tname == "iq2_s"))
+             load_vec_quant = "8";
+-        else if ((tname == "q2_0") || (tname == "q5_0") || (tname == "q8_0") || (tname == "q2_k") || (tname == "q4_k") || (tname == "q5_k") || (tname == "iq3_xxs") || (tname == "iq3_s") || (tname == "iq4_xs") || (tname == "iq4_nl") || (tname == "mxfp4") || (tname == "nvfp4"))
++        else if ((tname == "q2_0") || (tname == "q5_0") || (tname == "q8_0") || (tname == "q2_k") || (tname == "q4_k") || (tname == "q5_k") || (tname == "iq3_xxs") || (tname == "iq3_s") || (tname == "iq4_xs") || (tname == "iq4_nl") || (tname == "mxfp4") || (tname == "nvfp4") ||
++                 (tname == "rocmfp4") || (tname == "rocmfp4_fast") ||
++                 (tname == "rocmfpx_fp3") || (tname == "rocmfpx_fp6") || (tname == "rocmfpx_fp8"))
+             load_vec_quant = "4";
+ 
+         if (tname == "bf16") {
+@@ -623,7 +630,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
+ 
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         // Integer dot mmq performs better with f32 accumulators (different shader, skip for dot2)
+-        if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4")) {
++        if (!f16acc && !coopmat && !coopmat2 && !dot2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4" ||
++                                                          tname == "rocmfp4" || tname == "rocmfp4_fast")) {
+             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
+         }
+ #endif
+@@ -765,7 +773,9 @@ void process_shaders() {
+ 
+         // mul mat vec with integer dot product
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+-        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") {
++        if (is_legacy_quant(tname) || tname == "mxfp4" ||
++            tname == "rocmfp4" || tname == "rocmfp4_fast" || tname == "rocmfpx_fp8" ||
++            is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") {
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+@@ -833,13 +843,21 @@ void process_shaders() {
+     string_to_spv("cpy_transpose_02_16", "copy_transpose_02.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+     string_to_spv("cpy_transpose_02_32", "copy_transpose_02.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+ 
+-    for (std::string t : {"q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
++    string_to_spv("cpy_rocmfp4_rocmfp4", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "18"}});
++    string_to_spv("cpy_rocmfp4_fast_rocmfp4_fast", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "17"}});
++    string_to_spv("cpy_rocmfpx_fp3_rocmfpx_fp3", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "14"}});
++    string_to_spv("cpy_rocmfpx_fp6_rocmfpx_fp6", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "26"}});
++    string_to_spv("cpy_rocmfpx_fp8_rocmfpx_fp8", "copy_quant_same.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}, {"QUANT_K", "32"}, {"BLOCK_BYTES", "33"}});
++
++    for (std::string t : {"q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl",
++                          "rocmfp4", "rocmfp4_fast", "rocmfpx_fp3", "rocmfpx_fp6", "rocmfpx_fp8"}) {
+         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+     }
+ 
+     for (auto src : {std::pair{"f32", "float"}, std::pair{"f16", "float16_t"}}) {
+-        for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
++        for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl",
++                                "rocmfp4", "rocmfp4_fast", "rocmfpx_fp3", "rocmfpx_fp6", "rocmfpx_fp8"}) {
+             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+         }
+@@ -902,6 +920,7 @@ void process_shaders() {
+     string_to_spv("concat_i16", "concat.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+     string_to_spv("concat_i32", "concat.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+     string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
++    string_to_spv("concat_transpose_i32", "concat_transpose.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+ 
+     string_to_spv("upscale_f32", "upscale.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+ 
+@@ -1252,7 +1271,9 @@ void write_output_files() {
+ 
+     for (const std::string& btype : btypes) {
+     for (const auto& tname : type_names) {
+-        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m") {
++        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" &&
++            tname != "rocmfp4" && tname != "rocmfp4_fast" && tname != "rocmfpx_fp8" &&
++            !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m") {
+             continue;
+         }
+         hdr << "extern const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3];\n";
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b388e028c..3edd29d6e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1361,6 +1361,8 @@ struct llm_graph_context {
+ 
+     void build_sampling() const;
+ 
++    virtual void build_post_sampling() const {}
++
+     //
+     // dense (out)
+     //
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 309dd4324..28968a95b 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -164,13 +164,18 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+-        ggml_build_forward_expand(gf, cur);
+-
+         // Determine layer type and build appropriate attention mechanism
+         if (hparams.is_recr(il)) {
+             // Linear attention layer (gated delta net)
+             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
++
++            // build_layer_attn_linear() adds the GDN state cache writes as sink nodes. Close the
++            // branch only after they exist, or they order against the wrong node set and can race
++            // with the state reads of the next token or layer.
++            ggml_build_forward_expand(gf, cur);
+         } else {
++            ggml_build_forward_expand(gf, cur);
++
+             // Full attention layer
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+         }
+@@ -456,17 +461,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     // Apply gated normalization: self.norm(core_attn_out, z)
+     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+ 
+-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
+-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
++    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs]
++    // Flattened to 2D before the projection rather than after it: keeping the
++    // token and sequence axes separate makes src1 [D, n_seq_tokens, n_seqs], which
++    // the backends dispatch as n_seqs independent n=n_seq_tokens mat-vecs over the
++    // same weight. During batched decode (n_seq_tokens == 1, n_seqs == batch) that
++    // is one GEMV per sequence instead of a single batch-wide one.
++    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+     cb(final_output, "final_output", il);
+ 
+-    // Output projection
++    // Output projection - already [n_embd, n_seq_tokens * n_seqs]
+     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+     cb(cur, "linear_attn_out", il);
+ 
+-    // Reshape back to original dimensions
+-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+-
+     return cur;
+ }
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 38f2a5798..a51f58635 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -187,13 +187,18 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+-        ggml_build_forward_expand(gf, cur);
+-
+         // Determine layer type and build appropriate attention mechanism
+         if (hparams.is_recr(il)) {
+             // Linear attention layer (gated delta net)
+             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
++
++            // build_layer_attn_linear() adds the GDN state cache writes as sink nodes. Close the
++            // branch only after they exist, or they order against the wrong node set and can race
++            // with the state reads of the next token or layer.
++            ggml_build_forward_expand(gf, cur);
+         } else {
++            ggml_build_forward_expand(gf, cur);
++
+             // Full attention layer
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+         }
+@@ -480,17 +485,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     // Apply gated normalization: self.norm(core_attn_out, z)
+     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+ 
+-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
+-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
++    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs]
++    // Flattened to 2D before the projection rather than after it: keeping the token
++    // and sequence axes separate makes src1 [D, n_seq_tokens, n_seqs], which the
++    // backends dispatch as n_seqs independent n=n_seq_tokens mat-vecs over the same
++    // weight. During batched decode (n_seq_tokens == 1, n_seqs == batch) that is one
++    // GEMV per sequence instead of a single batch-wide one.
++    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+     cb(final_output, "final_output", il);
+ 
+-    // Output projection
++    // Output projection - already [n_embd, n_seq_tokens * n_seqs]
+     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+     cb(cur, "linear_attn_out", il);
+ 
+-    // Reshape back to original dimensions
+-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+-
+     return cur;
+ }
+ 

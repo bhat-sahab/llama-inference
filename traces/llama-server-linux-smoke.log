@@ -1,0 +1,24 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[34m0.00.045.321[0m [35mW srv  llama_server: -----------------
+[0m[34m0.00.045.322[0m [35mW srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+[0m[34m0.00.045.322[0m [35mW srv  llama_server: this can be a security risk (cross-origin attacks)
+[0m[34m0.00.045.322[0m [35mW srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+[0m[34m0.00.045.322[0m [35mW srv  llama_server: -----------------
+[0m[34m0.00.300.895[0m [35mW model has unused tensor blk.32.attn_norm.weight (size = 16384 bytes) -- ignoring
+[0m[34m0.00.300.900[0m [35mW model has unused tensor blk.32.post_attention_norm.weight (size = 16384 bytes) -- ignoring
+[0m[34m0.00.300.905[0m [35mW model has unused tensor blk.32.attn_q.weight (size = 35651584 bytes) -- ignoring
+[0m[34m0.00.300.907[0m [35mW model has unused tensor blk.32.attn_k.weight (size = 4456448 bytes) -- ignoring
+[0m[34m0.00.300.909[0m [35mW model has unused tensor blk.32.attn_v.weight (size = 4456448 bytes) -- ignoring
+[0m[34m0.00.300.915[0m [35mW model has unused tensor blk.32.attn_output.weight (size = 17825792 bytes) -- ignoring
+[0m[34m0.00.300.917[0m [35mW model has unused tensor blk.32.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+[0m[34m0.00.300.919[0m [35mW model has unused tensor blk.32.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+[0m[34m0.00.300.921[0m [35mW model has unused tensor blk.32.ffn_gate.weight (size = 53477376 bytes) -- ignoring
+[0m[34m0.00.300.923[0m [35mW model has unused tensor blk.32.ffn_down.weight (size = 53477376 bytes) -- ignoring
+[0m[34m0.00.300.925[0m [35mW model has unused tensor blk.32.ffn_up.weight (size = 53477376 bytes) -- ignoring
+[0m[34m0.00.300.927[0m [35mW model has unused tensor blk.32.nextn.eh_proj.weight (size = 35651584 bytes) -- ignoring
+[0m[34m0.00.300.929[0m [35mW model has unused tensor blk.32.nextn.enorm.weight (size = 16384 bytes) -- ignoring
+[0m[34m0.00.300.931[0m [35mW model has unused tensor blk.32.nextn.hnorm.weight (size = 16384 bytes) -- ignoring
+[0m[34m0.00.300.937[0m [35mW model has unused tensor blk.32.nextn.shared_head_norm.weight (size = 16384 bytes) -- ignoring
+[0m[34m0.05.108.366[0m [35mW srv          init: --cache-idle-slots requires --cache-ram, disabling
+[0m[34m0.05.110.626[0m [35mW srv          init: chat template does NOT support preserving reasoning, --reasoning-preserve has no effect
+[0m

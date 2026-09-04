@@ -1,0 +1,41 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+0.00.081.315 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.081.555 W srv  llama_server: -----------------
+0.00.081.556 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.081.556 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.081.556 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.081.556 W srv  llama_server: -----------------
+0.00.082.702 I srv    load_model: loading model '/run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q2_K_XL.gguf'
+0.00.364.387 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.364.391 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.364.397 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
+0.00.364.399 W model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
+0.00.364.401 W model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
+0.00.364.408 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
+0.00.364.410 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.364.412 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.364.414 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
+0.00.364.416 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
+0.00.364.419 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
+0.00.364.421 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
+0.00.364.423 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.364.426 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.364.432 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.02.951.406 I cmn          init: llama threadpool init, n_threads = 8
+0.02.995.527 I common_speculative_init_result: loading draft model '/run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf'
+0.03.563.534 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 4096, kv_unified = 'false'
+0.03.563.560 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dflash'
+0.03.563.561 I common_speculative_impl_draft_dflash: - n_max=4, n_min=0, p_min=0.00
+0.03.563.562 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=248070, n_extract=5, sample_from_anchor=true
+0.03.573.878 W srv          init: --cache-idle-slots requires --cache-ram, disabling
+0.03.578.539 I srv  llama_server: model loaded
+0.03.578.543 I srv  llama_server: listening on http://127.0.0.1:8099
+0.04.011.507 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+0.04.011.537 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.05.173.075 I slot print_timing: id  0 | task 0 | prompt eval time =     491.52 ms /    61 tokens (    8.06 ms per token,   124.10 tokens per second)
+0.05.173.077 I slot print_timing: id  0 | task 0 |        eval time =     669.99 ms /    33 tokens (   20.94 ms per token,    47.76 tokens per second)
+0.05.173.078 I slot print_timing: id  0 | task 0 |       total time =    1161.51 ms /    94 tokens
+0.05.173.080 I slot print_timing: id  0 | task 0 |    graphs reused =          9
+0.05.173.083 I slot print_timing: id  0 | task 0 | draft acceptance = 0.66667 (   24 accepted /    36 generated), mean len =  3.67
+0.05.173.111 I slot      release: id  0 | task 0 | stop processing: n_tokens = 94, truncated = 0
+0.05.177.151 I srv    operator(): operator(): cleaning up before exit...

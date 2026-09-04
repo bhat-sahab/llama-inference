@@ -1,0 +1,14 @@
+0.00.013.906 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.014.258 W srv  llama_server: -----------------
+0.00.014.259 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.014.259 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.014.259 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.014.259 W srv  llama_server: -----------------
+0.00.015.463 I srv    load_model: loading model '/run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf'
+0.00.480.685 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --no-mmap for better performance
+0.01.301.841 W init_moe_expert_cache: cannot open profile '/nonexistent-profile.csv' - expert cache disabled
+0.01.466.486 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 4096, kv_unified = 'true'
+0.01.476.771 I srv          init: chat template supports preserving reasoning, consider enabling it via --reasoning-preserve
+0.01.476.795 I srv  llama_server: model loaded
+0.01.476.798 I srv  llama_server: listening on http://127.0.0.1:8094
+1.29.979.858 I srv    operator(): operator(): cleaning up before exit...

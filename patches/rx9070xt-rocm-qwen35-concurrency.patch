@@ -1,0 +1,40 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3b2a0ea85..87f631d51 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4399,8 +4399,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     // 5. save the original cgraph and restore it in graph_compute, to enable fusion within streams
+     // See discussion: https://github.com/ggml-org/llama.cpp/pull/16991#issuecomment-3522620030
+ 
+-    const int min_fan_out = 3;
+-    const int max_fan_out = 3;
++    const int min_fan_out = 2;
++    const int max_fan_out = 4;
++
++    static const bool enable_ffn_concurrency = [] {
++        const char * env = getenv("GGML_CUDA_GRAPH_OPT_FFN");
++        return env != nullptr && atoi(env) == 1;
++    }();
++
++    static const bool enable_qwen35_concurrency = [] {
++        const char * env = getenv("GGML_CUDA_GRAPH_OPT_QWEN35");
++        return env != nullptr && atoi(env) == 1;
++    }();
+ 
+     // store {fork_idx, join_idx}
+     std::vector<std::pair<int, int>> concurrent_node_ranges;
+@@ -4409,8 +4419,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         if (count >= min_fan_out && count <= max_fan_out) {
+             const int root_node_idx = node_indices[root_node];
+ 
+-            // only optimize for attn_norm
+-            // TODO: make this more generic
+-            if (!strstr(root_node->name, "attn_norm")) {
++            const bool is_attn_fork = count == 3 && strstr(root_node->name, "attn_norm");
++            const bool is_ffn_fork = enable_ffn_concurrency && count == 2 && root_node->ne[1] > 1 &&
++                                     strstr(root_node->name, "attn_post_norm");
++            const bool is_qwen35_fork = enable_qwen35_concurrency && count == 4 && root_node->ne[1] > 1 &&
++                                        strstr(root_node->name, "attn_norm");
++            if (!is_attn_fork && !is_ffn_fork && !is_qwen35_fork) {
+                 continue;
+             }

@@ -1,31 +1,40 @@
-# Binaries
-llama.cpp/bin/
+# ── Built backend binaries (multi-GB, rebuilt via scripts/) ───────────────
+backends/bin/
 
-# Models
-llama.cpp/models/
+# ── llama.cpp source trees (each is its own git clone) ────────────────────
+llama.cpp-src/
+llama.cpp-perf/
+llama.cpp-stew675/
+llama.cpp-rdna-boosts/
 
-# Downloaded archives
-llama.cpp/*.zip
-llama.cpp/*.tar.gz
+# ── Vendored headers + bundled Linux toolchain (re-downloadable) ──────────
+vendor/
+tools/linux/
 
-# Python
+# ── Models (symlink to external LM Studio store) ──────────────────────────
+models
+*.gguf
+
+# ── Downloaded archives ───────────────────────────────────────────────────
+*.zip
+*.tar.gz
+
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 .venv/
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 
-# OS
+# ── OS ────────────────────────────────────────────────────────────────────
 Thumbs.db
 .DS_Store
 
-# Config with user paths
+# ── Config with user-specific paths ───────────────────────────────────────
 launcher_config.json
 
-# PowerShell launcher (legacy — use launcher.py instead)
-llama.ps1
-
-# Temp files
-test.html
+# ── Transient server logs (keep curated runs in traces/) ──────────────────
+_*.log
+*_server.log

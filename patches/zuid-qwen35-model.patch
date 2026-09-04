@@ -1,0 +1,171 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0402044da..07a81abea 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2314,6 +2314,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         }
+     }
+ 
++    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
++        const uint32_t selector_tokens = std::min<uint32_t>(
++                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
++        res += 32*selector_tokens;
++    }
++
+     uint32_t n_sampling_nodes = 0;
+     uint32_t n_sampling_nodes_max = 0;
+     for (const auto & [seq_id, sampler] : sampling.samplers) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b388e028c..3edd29d6e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1361,6 +1361,8 @@ struct llm_graph_context {
+ 
+     void build_sampling() const;
+ 
++    virtual void build_post_sampling() const {}
++
+     //
+     // dense (out)
+     //
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 33f5661b2..e43f40ecb 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2543,6 +2543,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+ 
+     // add backend sampling layers (if any)
+     llm->build_sampling();
++    llm->build_post_sampling();
+ 
+     // if the gguf model was converted with --sentence-transformers-dense-modules
+     // there will be two additional dense projection layers
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 44bd96757..f0acf28c4 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -363,6 +363,11 @@ struct llama_layer {
+     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
+ 
++    struct ggml_tensor * dflash_attn_conv_base = nullptr;
++    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
++    struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
++    struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
++
+     // mamba proj
+     struct ggml_tensor * ssm_in  = nullptr;
+     struct ggml_tensor * ssm_x   = nullptr;
+@@ -649,6 +654,10 @@ struct llama_model {
+     struct ggml_tensor * dspark_conf_proj   = nullptr;
+     struct ggml_tensor * dspark_conf_proj_b = nullptr;
+ 
++    struct ggml_tensor * dflash_selector_prev   = nullptr;
++    struct ggml_tensor * dflash_selector_next   = nullptr;
++    struct ggml_tensor * dflash_selector_hidden = nullptr;
++
+     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
+     std::vector<int32_t> target_layer_ids;
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 309dd4324..28968a95b 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -164,13 +164,18 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+-        ggml_build_forward_expand(gf, cur);
+-
+         // Determine layer type and build appropriate attention mechanism
+         if (hparams.is_recr(il)) {
+             // Linear attention layer (gated delta net)
+             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
++
++            // build_layer_attn_linear() adds the GDN state cache writes as sink nodes. Close the
++            // branch only after they exist, or they order against the wrong node set and can race
++            // with the state reads of the next token or layer.
++            ggml_build_forward_expand(gf, cur);
+         } else {
++            ggml_build_forward_expand(gf, cur);
++
+             // Full attention layer
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+         }
+@@ -456,17 +461,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     // Apply gated normalization: self.norm(core_attn_out, z)
+     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+ 
+-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
+-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
++    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs]
++    // Flattened to 2D before the projection rather than after it: keeping the
++    // token and sequence axes separate makes src1 [D, n_seq_tokens, n_seqs], which
++    // the backends dispatch as n_seqs independent n=n_seq_tokens mat-vecs over the
++    // same weight. During batched decode (n_seq_tokens == 1, n_seqs == batch) that
++    // is one GEMV per sequence instead of a single batch-wide one.
++    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+     cb(final_output, "final_output", il);
+ 
+-    // Output projection
++    // Output projection - already [n_embd, n_seq_tokens * n_seqs]
+     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+     cb(cur, "linear_attn_out", il);
+ 
+-    // Reshape back to original dimensions
+-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+-
+     return cur;
+ }
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 38f2a5798..a51f58635 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -187,13 +187,18 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+-        ggml_build_forward_expand(gf, cur);
+-
+         // Determine layer type and build appropriate attention mechanism
+         if (hparams.is_recr(il)) {
+             // Linear attention layer (gated delta net)
+             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
++
++            // build_layer_attn_linear() adds the GDN state cache writes as sink nodes. Close the
++            // branch only after they exist, or they order against the wrong node set and can race
++            // with the state reads of the next token or layer.
++            ggml_build_forward_expand(gf, cur);
+         } else {
++            ggml_build_forward_expand(gf, cur);
++
+             // Full attention layer
+             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+         }
+@@ -480,17 +485,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     // Apply gated normalization: self.norm(core_attn_out, z)
+     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+ 
+-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
+-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
++    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs]
++    // Flattened to 2D before the projection rather than after it: keeping the token
++    // and sequence axes separate makes src1 [D, n_seq_tokens, n_seqs], which the
++    // backends dispatch as n_seqs independent n=n_seq_tokens mat-vecs over the same
++    // weight. During batched decode (n_seq_tokens == 1, n_seqs == batch) that is one
++    // GEMV per sequence instead of a single batch-wide one.
++    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+     cb(final_output, "final_output", il);
+ 
+-    // Output projection
++    // Output projection - already [n_embd, n_seq_tokens * n_seqs]
+     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+     cb(cur, "linear_attn_out", il);
+ 
+-    // Reshape back to original dimensions
+-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+-
+     return cur;
+ }
+ 

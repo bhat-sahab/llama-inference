@@ -1,0 +1,100 @@
+[H[2J[3J================================================
+  Qwen3.6 / KAT-Coder / Qwen3.8 - Launcher (Linux)
+================================================
+
+  Select model:
+   [1] Qwen3.6 IQ4_XS MTP (18.2 GB, MTP, vision)
+   [2] KAT-Coder IQ4_XS MTP (19.7 GB)
+   [3] Qwen3.8-27B IQ4_XS (14.3 GB, dense, vision)
+   [4] Qwen3.8-27B Q3_K_XL (13.1 GB, dense, vision)
+   [5] Qwen3.8-27B Q3_K_M (13.8 GB, dense, vision)
+   [6] Qwen3.8-27B Ridge-3.7bpw (12.6 GB, dense, vision)
+   [7] Qwen3.8-27B Q2_K_XL (~9 GB, dense, vision)
+   [8] Qwen3.8-9B-Distill Q8_0 (9.1 GB, q8_0 KV)
+
+  Choice [1-8]:  [H[2J[3J================================================
+  Model  : /run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+  Backend: 
+  Context: 32768
+================================================
+
+  Select backend (auto-discovered):
+   [1] rocm-linux
+   [2] rocm-moe-linux (perf fork - MoE expert cache)
+   [3] rocm-stew675-linux
+   [4] vulkan-linux
+
+  Backend [1-4]:  [H[2J[3J================================================
+  Model  : /run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+  Backend: /run/media/bhatsahab/New Volume/Work/llama/backends/bin/rocm-moe-linux/llama-server
+  Context: 32768
+================================================
+
+  Vision (multimodal projector):
+   [1] ON - CPU  (--no-mmproj-offload, saves ~0.9 GB VRAM)
+   [2] ON - GPU  (faster image encode)
+   [3] OFF
+
+  Vision [1-3]:  [H[2J[3J================================================
+  Model  : /run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+  Backend: /run/media/bhatsahab/New Volume/Work/llama/backends/bin/rocm-moe-linux/llama-server
+  Context: 32768
+================================================
+
+  Select context window (pp | tg t/s):
+   [1] 32K   pp ~2900 | tg ~37
+   [2] 64K   pp ~2500 | tg ~48
+   [3] 80K   pp ~2500 | tg ~48
+   [4] 100K  pp ~2400 | tg ~47
+   [5] 128K  pp ~2400 | tg ~47
+   [6] 150K  pp ~2400 | tg ~47
+   [7] 180K  pp ~1200 | tg ~40
+   [8] 200K  pp ~1200 | tg ~40
+   [9] 256K  pp ~1200 | tg ~45
+
+  Context [1-9]:  [H[2J[3J================================================
+  Model  : /run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+  Backend: /run/media/bhatsahab/New Volume/Work/llama/backends/bin/rocm-moe-linux/llama-server
+  Context: 32768
+================================================
+
+  MTP speculative decoding:
+   [1] Normal MTP  (draft-mtp)
+   [2] Tuned MTP   (per-backend: vk combined / stew adaptive / selfbuilt adaptive)
+   [3] OFF         (safe)
+
+  MTP [1-3]:  [H[2J[3J================================================
+  Starting llama-server...
+================================================
+   Model     : /run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+   Backend   : /run/media/bhatsahab/New Volume/Work/llama/backends/bin/rocm-moe-linux/llama-server
+   Context   : 32768   Batch: 4096   UBatch: 4096   ncmoe: 18
+   KV cache  : -ctk q4_0 -ctv q4_0   cache-ram: 0
+   Sampling  : --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0
+   Reasoning : 
+   MTP/Spec  : (off)
+   MoE cache : /run/media/bhatsahab/New Volume/Work/llama/traces/q36-routing.csv (112 slots)
+   Vision    : /run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/mmproj-F32.gguf (CPU offload)
+   Fixed     : -t 8 --flash-attn on --load-mode none --no-repack --fit off -np 1 --port 8081 --jinja --log-colors on -lv 3 --log-timestamps
+
+  Server: http://localhost:8081
+  Press Ctrl+C to stop
+================================================
+
+[34m0.00.017.584[0m [32mI [0mcmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+[34m0.00.017.833[0m [35mW srv  llama_server: -----------------
+[0m[34m0.00.017.833[0m [35mW srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+[0m[34m0.00.017.834[0m [35mW srv  llama_server: this can be a security risk (cross-origin attacks)
+[0m[34m0.00.017.834[0m [35mW srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+[0m[34m0.00.017.834[0m [35mW srv  llama_server: -----------------
+[0m[34m0.00.018.987[0m [32mI [0msrv    load_model: loading model '/run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf'
+[34m0.09.747.102[0m [35mW load_hparams: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks
+[0m[34m0.09.747.103[0m [35mW load_hparams: if you encounter problems with accuracy, try adding --image-min-tokens 1024
+[0m[34m0.09.747.104[0m [35mW load_hparams: more info: https://github.com/ggml-org/llama.cpp/issues/16842
+
+[0m[34m0.10.557.166[0m [32mI [0msrv    load_model: loaded multimodal model, '/run/media/bhatsahab/D8647E62647E42F4/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/mmproj-F32.gguf'
+[34m0.10.604.957[0m [32mI [0msrv    load_model: initializing, n_slots = 1, n_ctx_slot = 32768, kv_unified = 'false'
+[34m0.10.605.035[0m [35mW srv          init: --cache-idle-slots requires --cache-ram, disabling
+[0m[34m0.10.614.926[0m [32mI [0msrv          init: chat template supports preserving reasoning, consider enabling it via --reasoning-preserve
+[34m0.10.614.948[0m [32mI [0msrv  llama_server: model loaded
+[34m0.10.614.951[0m [32mI [0msrv  llama_server: listening on http://0.0.0.0:8081
