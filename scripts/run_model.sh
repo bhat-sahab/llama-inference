@@ -17,7 +17,7 @@
 # =============================================================================
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Symlink in the repo (models -> external LM Studio folder) so paths stay portable.
 MODELS_ROOT="$ROOT/models"
 PORT=8081

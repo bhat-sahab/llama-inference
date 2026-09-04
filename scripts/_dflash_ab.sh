@@ -7,7 +7,7 @@
 #   port         : optional (default 8098)
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRV="$ROOT/backends/bin/${1:-rocm-linux}/llama-server"
 TARGET="${2:-/mnt/nvme/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf}"
 DRAFT="/mnt/nvme/Users/BhatSahab/.lmstudio/models/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"

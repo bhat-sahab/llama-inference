@@ -5,7 +5,7 @@
 #   backend-dir : rocm-linux | rocm-moe-linux | rocm-stew675-linux (under backends/bin/)
 #   start-index : 0-based index into MODELS to resume from (default 0)
 set -u
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BE="${1:-rocm-linux}"
 START_IDX="${2:-0}"
 SRV="$ROOT/backends/bin/$BE/llama-server"

@@ -4,7 +4,7 @@
 # Longer, more repetitive-structure output gives ngram-mod an actual chance to draft.
 # Usage: _dflash_ngram_story_test.sh <backend-dir> [start-index]
 set -u
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BE="${1:-rocm-linux}"
 START_IDX="${2:-0}"
 SRV="$ROOT/backends/bin/$BE/llama-server"

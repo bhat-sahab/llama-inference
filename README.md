@@ -8,12 +8,17 @@ outputs and llama.cpp source trees are deliberately untracked — see [Layout](#
 
 ## Quick start
 
+From the repository root:
+
 ```bash
-python run_model.py              # interactive menu: model → backend → vision → context → MTP
-python run_model.py list         # show all models/backends with on-disk status
-python run_model.py run  --model ridge --backend vulkan --ctx 32768
-python run_model.py test --model q36  --backend moe    --ctx 32768 --tokens 64
+python scripts/run_model.py              # interactive menu: model → backend → vision → context → MTP
+python scripts/run_model.py list         # show all models/backends with on-disk status
+python scripts/run_model.py run  --model ridge --backend vulkan --ctx 32768
+python scripts/run_model.py test --model q36  --backend moe    --ctx 32768 --tokens 64
 ```
+
+Shell and Windows launchers are also available at `scripts/run_model.sh` and
+`scripts/run_model.bat`; use `python scripts/run_model.py gui` for the graphical launcher.
 
 `test` boots the server, polls until ready, runs a fixed prompt, and reports **measured** pp/tg
 next to the expected numbers baked into the model table.
@@ -40,13 +45,13 @@ Two rules that cost the most time to learn:
 
 | Path | Tracked | Contents |
 |---|:---:|---|
-| `run_model.py` / `.sh` / `.bat` | ✅ | Launcher + benchmark harness (`run_model_ui.py` = GUI) |
+| `scripts/run_model.py` / `.sh` / `.bat` | ✅ | Launcher + benchmark harness (`run_model_ui.py` = GUI) |
 | `knowledge-base/` | ✅ | Benchmark findings and configs |
-| `scripts/` | ✅ | Per-backend build scripts (`build_linux_*.sh`, `build_*.ps1`) |
+| `scripts/build_*` | ✅ | Per-backend Linux and Windows build scripts |
+| `scripts/_dflash_*.sh`, `scripts/_moe_ab.sh` | ✅ | Current A/B experiments (DFlash2 draft + ngram speculative decoding) |
 | `patches/` | ✅ | RDNA4 patches: GDN clustered-columns, mmvq dynamic-warps, adaptive spec |
 | `tools/` | ✅ | `server_test.py`, `vision_test.py`, `mtp_test.py`, GPU reset/monitor, ADLX power |
 | `traces/` | ✅ | Raw benchmark logs behind the knowledge base |
-| `_dflash_*.sh`, `_moe_ab.sh` | ✅ | Current A/B experiments (DFlash2 draft + ngram speculative decoding) |
 | `backends/bin/` | ❌ | Built `llama-server` per backend — rebuild via `scripts/` |
 | `llama.cpp-{src,perf,stew675,rdna-boosts}/` | ❌ | Upstream + fork clones, each its own git repo |
 | `vendor/`, `tools/linux/` | ❌ | Vulkan/SPIRV headers + bundled CMake/Ninja toolchain |

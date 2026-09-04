@@ -2,7 +2,7 @@
 # Sanity check: greedy (temp 0) output with DFlash2 on a given backend.
 # Usage: _dflash_sanity.sh <backend-dir>
 set -u
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BE="${1:-rocm-linux}"
 SRV="$ROOT/backends/bin/$BE/llama-server"
 MODEL="/mnt/nvme/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q2_K_XL.gguf"

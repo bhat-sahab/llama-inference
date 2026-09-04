@@ -3,7 +3,7 @@
 # Usage: _moe_ab.sh <on|off> <slots> [model] [profile] [extra-server-args...]
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRV="$ROOT/backends/bin/rocm-moe-linux/llama-server"
 MODEL="${3:-/mnt/nvme/Users/BhatSahab/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf}"
 PROFILE="${4:-$ROOT/traces/q36-routing.csv}"

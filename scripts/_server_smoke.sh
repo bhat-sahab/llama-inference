@@ -3,7 +3,7 @@
 # flags run_model.sh uses, poll /health, run one tiny completion, then stop.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRV="$ROOT/backends/bin/vulkan-linux/llama-server"
 MODEL="/mnt/nvme/Users/BhatSahab/.lmstudio/models/empero-ai/Qwen3.8-9B-Distill-GGUF/Qwen3.8-9B-Q8_0.gguf"
 LOG="$ROOT/traces/llama-server-linux-smoke.log"
