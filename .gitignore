@@ -1,11 +1,37 @@
 # ── Built backend binaries (multi-GB, rebuilt via scripts/) ───────────────
-backends/bin/
+backends/bin*/
 
 # ── llama.cpp source trees (each is its own git clone) ────────────────────
-llama.cpp-src/
-llama.cpp-perf/
-llama.cpp-stew675/
-llama.cpp-rdna-boosts/
+llama.cpp-*/
+
+# ── Build output (trailing slash = directories only, so scripts/build_*.sh
+#    stays tracked) ──────────────────────────────────────────────────────
+build/
+build-*/
+build_*/
+cmake-build*/
+out/
+.ccache/
+
+# ── Compiled artifacts ────────────────────────────────────────────────────
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.pdb
+
+# ROCm/Tensile precompiled kernels — these are what bloated .git to 2 GB
+*.co
+*.dat.zlib
+
+# Keep the ADLX power-tuning binaries (no rocm-smi on Windows; hard to source)
+!tools/adlx-apply.exe
+!tools/adlx-profile.exe
 
 # ── Vendored headers + bundled Linux toolchain (re-downloadable) ──────────
 vendor/
